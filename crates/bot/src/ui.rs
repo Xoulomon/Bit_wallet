@@ -470,3 +470,417 @@ mod lifecycle_tests {
         assert!(ask_backup_word(11, 3).contains("word number 12"));
     }
 }
+
+// ------------------------------------------------------------------- on-chain
+// `comfy-table` into a <pre> block is the one place monospace survives a
+// Telegram client, which is why the plan keeps it for /history and /addresses
+// (§2, §8.2).
+
+use comfy_table::{ContentArrangement, Table, presets::UTF8_BORDERS_ONLY};
+use wallet_core::types::{
+    AddressInfo, BalanceView, Page, Paged, TxDetail, TxDirection, TxStatus, TxSummary,
+};
+
+pub fn sats_and_btc(amount: Amount) -> String {
+    format!("{} ({:.8} BTC)", sats(amount), amount.to_btc())
+}
+
+/// §8.2: confirmed, pending and immature, in sats *and* BTC.
+///
+/// The mainnet caveat is not a footnote: without `getrawmempool` an incoming
+/// payment that has not confirmed is not zero, it is unseen, and a user staring
+/// at a balance deserves to be told which (§4b).
+pub fn balance(network: Network, b: &BalanceView) -> String {
+    let mut out = format!(
+        "{}\n\n<b>Balance</b>\n<code>Confirmed  {}</code>",
+        badge(network),
+        sats_and_btc(b.confirmed)
+    );
+
+    if b.trusted_pending > Amount::ZERO {
+        out.push_str(&format!(
+            "\n<code>Sending    {}</code>",
+            sats(b.trusted_pending)
+        ));
+    }
+    if b.untrusted_pending > Amount::ZERO {
+        out.push_str(&format!(
+            "\n<code>Incoming   {}</code>",
+            sats(b.untrusted_pending)
+        ));
+    }
+    if b.immature > Amount::ZERO {
+        out.push_str(&format!("\n<code>Immature   {}</code>", sats(b.immature)));
+    }
+
+    out.push_str(&format!("\n\n<b>Total {}</b>", sats_and_btc(b.total)));
+
+    if !b.unconfirmed_incoming_visible {
+        out.push_str(
+            "\n\nℹ️ Payments to you appear here once they're in a block, not before — \
+             this bot's node connection can't see the mempool.",
+        );
+    }
+
+    out
+}
+
+/// §8.2: address, BIP21 and the mainnet caveat, as a photo caption.
+pub fn receive(network: Network, info: &AddressInfo) -> String {
+    let mut out = format!(
+        "{}\n\n<b>Your address</b>\n<code>{}</code>\n\nUnused address #{}",
+        badge(network),
+        escape(&info.address.to_string()),
+        info.index
+    );
+
+    if network == Network::Bitcoin {
+        out.push_str(
+            "\n\nℹ️ A payment here shows up once it's in a block. Until then it won't \
+             appear in /balance, even though it's on its way.",
+        );
+    }
+
+    out
+}
+
+pub fn addresses(network: Network, page: &Paged<AddressInfo>) -> String {
+    if page.items.is_empty() {
+        return format!(
+            "{}\n\nNo addresses yet. /receive makes one.",
+            badge(network)
+        );
+    }
+
+    let mut table = Table::new();
+    table
+        .load_style(UTF8_BORDERS_ONLY)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec!["#", "Address", "Used", "Received"]);
+
+    for a in &page.items {
+        table.add_row(vec![
+            a.index.to_string(),
+            shorten(&a.address.to_string()),
+            if a.used { "yes" } else { "—" }.to_string(),
+            if a.received > Amount::ZERO {
+                group(a.received.to_sat())
+            } else {
+                "—".into()
+            },
+        ]);
+    }
+
+    format!(
+        "{}\n\n<pre>{}</pre>\n{}",
+        badge(network),
+        escape(&table.to_string()),
+        pager(page.page, page.total_pages())
+    )
+}
+
+pub fn history(network: Network, page: &Paged<TxSummary>) -> String {
+    if page.items.is_empty() {
+        return format!(
+            "{}\n\nNo transactions yet. /receive gives you an address to be paid at.",
+            badge(network)
+        );
+    }
+
+    let mut table = Table::new();
+    table
+        .load_style(UTF8_BORDERS_ONLY)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec!["", "Amount", "Fee", "Status"]);
+
+    for tx in &page.items {
+        table.add_row(vec![
+            direction_mark(tx.direction).to_string(),
+            group(tx.amount.to_sat()),
+            tx.fee
+                .map(|f| group(f.to_sat()))
+                .unwrap_or_else(|| "—".into()),
+            status_text(tx.status),
+        ]);
+    }
+
+    let mut out = format!(
+        "{}\n\n<pre>{}</pre>\n{}",
+        badge(network),
+        escape(&table.to_string()),
+        pager(page.page, page.total_pages())
+    );
+
+    // On mainnet a txid is worth linking; on regtest there is nothing to link to.
+    if network == Network::Bitcoin {
+        out.push_str("\n\n");
+        for tx in &page.items {
+            out.push_str(&format!(
+                "<a href=\"https://mempool.space/tx/{0}\">{1}</a>  ",
+                tx.txid,
+                shorten(&tx.txid.to_string())
+            ));
+        }
+    }
+
+    out
+}
+
+/// §8.2: one transaction in detail.
+pub fn tx_detail(network: Network, d: &TxDetail) -> String {
+    let s = &d.summary;
+    let mut out = format!(
+        "{}\n\n<b>{} {}</b>\n<code>{}</code>\n\n<code>Status  {}</code>",
+        badge(network),
+        match s.direction {
+            TxDirection::Incoming => "Received",
+            TxDirection::Outgoing => "Sent",
+            TxDirection::Internal => "Moved",
+        },
+        sats(s.amount),
+        escape(&s.txid.to_string()),
+        status_text(s.status)
+    );
+
+    if let Some(fee) = s.fee {
+        out.push_str(&format!("\n<code>Fee     {}</code>", sats(fee)));
+    }
+    if let Some(rate) = d.fee_rate {
+        out.push_str(&format!(
+            "\n<code>Rate    {} sat/vB</code>",
+            rate.to_sat_per_vb_ceil()
+        ));
+    }
+    out.push_str(&format!(
+        "\n<code>Size    {} vB</code>\n<code>In/Out  {} / {}</code>",
+        d.vsize, d.inputs, d.outputs
+    ));
+
+    if network == Network::Bitcoin {
+        out.push_str(&format!(
+            "\n\n<a href=\"https://mempool.space/tx/{}\">See it on mempool.space</a>",
+            s.txid
+        ));
+    }
+
+    out
+}
+
+fn direction_mark(d: TxDirection) -> &'static str {
+    match d {
+        TxDirection::Incoming => "📥",
+        TxDirection::Outgoing => "📤",
+        TxDirection::Internal => "🔁",
+    }
+}
+
+fn status_text(s: TxStatus) -> String {
+    match s {
+        TxStatus::Unconfirmed => "pending".into(),
+        TxStatus::Confirmed { confirmations, .. } if confirmations >= 6 => {
+            format!("✅ {confirmations} confs")
+        }
+        TxStatus::Confirmed { confirmations, .. } => format!("{confirmations} conf"),
+    }
+}
+
+/// The middle of a long identifier is the part nobody reads.
+pub fn shorten(s: &str) -> String {
+    if s.len() <= 16 {
+        return s.to_string();
+    }
+    format!("{}…{}", &s[..8], &s[s.len() - 4..])
+}
+
+fn pager(page: Page, total_pages: u32) -> String {
+    if total_pages <= 1 {
+        return String::new();
+    }
+    format!("Page {} of {}", page.index + 1, total_pages)
+}
+
+// -------------------------------------------------------------- notifications
+// §8.6: one match, one message. Core supplies the numbers; every word is here.
+
+pub fn incoming(amount: Amount, status: TxStatus) -> String {
+    match status {
+        TxStatus::Unconfirmed => format!("📥 Incoming {} — unconfirmed", sats(amount)),
+        TxStatus::Confirmed { confirmations, .. } => {
+            format!("📥 Received {} — ✅ {} conf", sats(amount), confirmations)
+        }
+    }
+}
+
+pub fn confirmed(txid: &str, confirmations: u32) -> String {
+    format!("✅ {} — {} confs", shorten(txid), confirmations)
+}
+
+pub fn session_expired() -> String {
+    "🔒 Session locked after inactivity.".into()
+}
+
+pub fn backend_degraded() -> String {
+    "⚠️ The Bitcoin backend is slow or rate-limited; commands may lag.".into()
+}
+
+pub fn backend_recovered() -> String {
+    "✅ Backend healthy again.".into()
+}
+
+#[cfg(test)]
+mod onchain_tests {
+    use super::*;
+    use wallet_core::bitcoin::Txid;
+    use wallet_core::types::{Page, Paged, TxDirection, TxSummary};
+
+    fn view(confirmed: u64, untrusted: u64, visible: bool) -> BalanceView {
+        BalanceView {
+            confirmed: Amount::from_sat(confirmed),
+            trusted_pending: Amount::ZERO,
+            untrusted_pending: Amount::from_sat(untrusted),
+            immature: Amount::ZERO,
+            total: Amount::from_sat(confirmed + untrusted),
+            unconfirmed_incoming_visible: visible,
+        }
+    }
+
+    fn txid(byte: u8) -> Txid {
+        Txid::from_raw_hash(wallet_core::bitcoin::hashes::Hash::from_byte_array(
+            [byte; 32],
+        ))
+    }
+
+    /// §4b's most user-visible consequence has to be *said*, not implied by a
+    /// zero that looks like a lost payment.
+    #[test]
+    fn a_backend_without_a_mempool_says_so_on_the_balance() {
+        let rendered = balance(Network::Bitcoin, &view(100_000, 0, false));
+        assert!(rendered.contains("in a block"));
+        assert!(rendered.starts_with("🟠 MAINNET"));
+    }
+
+    #[test]
+    fn a_backend_with_a_mempool_adds_no_caveat() {
+        let rendered = balance(Network::Regtest, &view(100_000, 5_000, true));
+        assert!(!rendered.contains("in a block"));
+        assert!(rendered.contains("Incoming"));
+    }
+
+    #[test]
+    fn a_balance_is_shown_in_sats_and_btc() {
+        let rendered = balance(Network::Regtest, &view(150_000, 0, true));
+        assert!(rendered.contains("150,000 sats"));
+        assert!(rendered.contains("0.00150000 BTC"));
+    }
+
+    #[test]
+    fn zero_categories_are_left_out_rather_than_shown_as_zero() {
+        let rendered = balance(Network::Regtest, &view(1_000, 0, true));
+        assert!(!rendered.contains("Immature"));
+        assert!(!rendered.contains("Incoming"));
+    }
+
+    #[test]
+    fn an_empty_history_offers_the_next_step() {
+        let empty: Paged<TxSummary> = Paged {
+            items: vec![],
+            page: Page::new(0),
+            total: 0,
+        };
+        assert!(history(Network::Regtest, &empty).contains("/receive"));
+    }
+
+    #[test]
+    fn history_links_txids_on_mainnet_and_not_on_regtest() {
+        let page = Paged {
+            items: vec![TxSummary {
+                txid: txid(1),
+                direction: TxDirection::Incoming,
+                amount: Amount::from_sat(25_000),
+                fee: None,
+                status: TxStatus::Confirmed {
+                    height: 100,
+                    confirmations: 3,
+                },
+                timestamp: None,
+            }],
+            page: Page::new(0),
+            total: 1,
+        };
+
+        assert!(history(Network::Bitcoin, &page).contains("mempool.space"));
+        assert!(!history(Network::Regtest, &page).contains("mempool.space"));
+    }
+
+    #[test]
+    fn a_pager_appears_only_when_there_is_more_than_one_page() {
+        let one: Paged<TxSummary> = Paged {
+            items: vec![],
+            page: Page::new(0),
+            total: 3,
+        };
+        assert_eq!(pager(one.page, one.total_pages()), "");
+
+        let many: Paged<TxSummary> = Paged {
+            items: vec![],
+            page: Page::new(1),
+            total: 25,
+        };
+        assert_eq!(pager(many.page, many.total_pages()), "Page 2 of 3");
+    }
+
+    #[test]
+    fn six_confirmations_reads_as_settled() {
+        assert!(
+            status_text(TxStatus::Confirmed {
+                height: 1,
+                confirmations: 6
+            })
+            .contains('✅')
+        );
+        assert_eq!(status_text(TxStatus::Unconfirmed), "pending");
+    }
+
+    #[test]
+    fn long_identifiers_are_shortened_in_the_middle() {
+        let full = txid(2).to_string();
+        let short = shorten(&full);
+        assert!(short.starts_with(&full[..8]));
+        assert!(short.ends_with(&full[full.len() - 4..]));
+        assert!(short.len() < full.len());
+        // Short strings are left alone.
+        assert_eq!(shorten("bc1qshort"), "bc1qshort");
+    }
+
+    #[test]
+    fn a_mainnet_receive_warns_that_incoming_is_invisible_until_confirmed() {
+        let info = AddressInfo {
+            address: "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"
+                .parse::<wallet_core::bitcoin::Address<_>>()
+                .expect("parses")
+                .assume_checked(),
+            index: 0,
+            used: false,
+            received: Amount::ZERO,
+            bip21: "bitcoin:bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu".into(),
+        };
+        assert!(receive(Network::Bitcoin, &info).contains("in a block"));
+        assert!(!receive(Network::Regtest, &info).contains("in a block"));
+    }
+
+    #[test]
+    fn notifications_distinguish_arrival_from_confirmation() {
+        assert!(incoming(Amount::from_sat(25_000), TxStatus::Unconfirmed).contains("unconfirmed"));
+        assert!(
+            incoming(
+                Amount::from_sat(25_000),
+                TxStatus::Confirmed {
+                    height: 1,
+                    confirmations: 1
+                }
+            )
+            .contains("Received")
+        );
+        assert!(confirmed(&txid(3).to_string(), 6).contains("6 confs"));
+    }
+}

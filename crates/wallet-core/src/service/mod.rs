@@ -35,8 +35,10 @@ pub struct WalletService {
     cfg: AppConfig,
     chain: ChainSource,
     events: broadcast::Sender<CoreEvent>,
-    storage: Storage,
+    storage: Arc<Storage>,
     sessions: Sessions,
+    /// Stops the sync task. Step 7 flushes persisters on the way out.
+    shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 impl WalletService {
@@ -66,8 +68,18 @@ impl WalletService {
             .map_err(|e| crate::error::CoreError::Storage(e.to_string()))?;
 
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let storage = Storage::open(&cfg.app_db())?;
+        let storage = Arc::new(Storage::open(&cfg.app_db())?);
         let sessions = Sessions::new(cfg.session_idle_timeout, events.clone());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        // One follower for every wallet: a block is fetched once, however many
+        // users there are (§6).
+        let syncer = crate::onchain::sync::ChainService::new(
+            cfg.clone(),
+            events.clone(),
+            Arc::clone(&storage),
+        );
+        tokio::spawn(syncer.run(shutdown_rx));
 
         Ok(Arc::new(WalletService {
             cfg,
@@ -75,6 +87,7 @@ impl WalletService {
             events,
             storage,
             sessions,
+            shutdown: shutdown_tx,
         }))
     }
 
@@ -117,6 +130,17 @@ impl WalletService {
             call_budget,
             degraded: false,
         })
+    }
+
+    /// Stop the background sync task and let it finish its current pass.
+    pub fn shutdown(&self) {
+        let _ = self.shutdown.send(true);
+    }
+
+    /// Bring this user's wallet to the tip now, rather than at the next pass.
+    /// The Refresh button of §8.2, and what the CLI calls before it prints.
+    pub async fn sync_now(&self, u: UserId) -> Result<u32> {
+        crate::onchain::sync::sync_now(&self.cfg, u).await
     }
 
     /// Subscribe to `CoreEvent`s (§3a rule 6). Core pushes; the front end
@@ -290,6 +314,31 @@ impl WalletService {
 
     // ------------------------------------------------------------------ helpers
 
+    /// Open this user's persisted wallet.
+    ///
+    /// Watch-only, and therefore PIN-free: the descriptors on disk are public
+    /// (§5). A user who has a vault but no wallet file yet — the window between
+    /// restore and the first sync — gets one built from their unlocked session.
+    fn open_wallet(&self, u: UserId) -> Result<crate::onchain::OpenWallet> {
+        let path = self.cfg.wallet_db(&u);
+        let network = self.network();
+
+        if path.exists() {
+            return crate::onchain::OpenWallet::load(&path, network);
+        }
+
+        if !self.storage.wallet_exists(u)? {
+            return Err(CoreError::NoWallet);
+        }
+
+        // The vault exists but the BDK file does not. Building it needs the
+        // descriptors, which need the mnemonic — so this is the one read path
+        // that wants an open session, and only once per wallet.
+        self.sessions
+            .with_mnemonic(u, |m| crate::onchain::OpenWallet::create(&path, m, network))
+            .ok_or(CoreError::Locked)?
+    }
+
     fn check_pin_policy(&self, pin: &Pin) -> Result<()> {
         if pin.is_well_formed() {
             Ok(())
@@ -355,30 +404,40 @@ impl WalletService {
     // -------------------------------------------------- watch-only (no PIN)
 
     /// MVP 4. `/receive`: the next unused external address (§6).
-    pub async fn next_address(&self, _u: UserId) -> Result<AddressInfo> {
-        todo!("Step 4: on-chain core")
+    pub async fn next_address(&self, u: UserId) -> Result<AddressInfo> {
+        let mut wallet = self.open_wallet(u)?;
+        let info = wallet.next_address()?;
+        Ok(info)
     }
 
     /// MVP 4. `/addresses`: revealed addresses with used/unused status (§6).
-    pub async fn addresses(&self, _u: UserId, _page: Page) -> Result<Paged<AddressInfo>> {
-        todo!("Step 4: on-chain core")
+    pub async fn addresses(&self, u: UserId, page: Page) -> Result<Paged<AddressInfo>> {
+        self.open_wallet(u)?.addresses(page)
     }
 
     /// MVP 6. Confirmed, pending and immature (§6).
-    pub async fn balance(&self, _u: UserId) -> Result<BalanceView> {
-        todo!("Step 4: on-chain core")
+    ///
+    /// `unconfirmed_incoming_visible` carries §4b's consequence as data: on
+    /// mainnet there is no `getrawmempool`, so a payment that has not made it
+    /// into a block is not merely zero — it is unseen, and the front end has to
+    /// be able to say which.
+    pub async fn balance(&self, u: UserId) -> Result<BalanceView> {
+        let visible = self.chain.capabilities().mempool;
+        Ok(self.open_wallet(u)?.balance(visible))
     }
 
     /// MVP 7. `/history`, newest first (§6).
-    pub async fn history(&self, _u: UserId, _page: Page) -> Result<Paged<TxSummary>> {
-        todo!("Step 4: on-chain core")
+    pub async fn history(&self, u: UserId, page: Page) -> Result<Paged<TxSummary>> {
+        let tip = self.tip_height().await?;
+        self.open_wallet(u)?.history(tip, page)
     }
 
     /// MVP 10. `/tx <txid>`; confirmations come from the wallet's own
     /// `ChainPosition`, not from `getrawtransaction`, so nothing depends on
     /// `txindex` at the shared node (§6).
-    pub async fn tx(&self, _u: UserId, _txid: Txid) -> Result<TxDetail> {
-        todo!("Step 4: on-chain core")
+    pub async fn tx(&self, u: UserId, txid: Txid) -> Result<TxDetail> {
+        let tip = self.tip_height().await?;
+        self.open_wallet(u)?.tx(txid, tip)
     }
 
     // ----------------------------------------------------------------- spending

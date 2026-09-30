@@ -10,6 +10,7 @@ mod auth;
 mod commands;
 mod dialogue;
 mod handlers;
+mod notify;
 mod ui;
 mod users;
 
@@ -61,14 +62,20 @@ async fn main() -> Result<()> {
         .await
         .context("registering the command menu")?;
 
+    // §8.6: one subscriber, running beside the dispatcher for as long as it does.
+    tokio::spawn(notify::run(bot.clone(), ctx.clone()));
+
     tracing::info!("dispatching");
 
     Dispatcher::builder(bot, schema())
-        .dependencies(dptree::deps![ctx, dialogues])
+        .dependencies(dptree::deps![ctx.clone(), dialogues])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
         .await;
+
+    // Let the chain follower finish its pass and flush what it staged.
+    ctx.core.shutdown();
 
     Ok(())
 }
@@ -92,6 +99,11 @@ fn schema() -> teloxide::dispatching::UpdateHandler<anyhow::Error> {
         .branch(case![Command::Lock].endpoint(handlers::wallet::lock))
         .branch(case![Command::Export].endpoint(handlers::wallet::export))
         .branch(case![Command::Delete].endpoint(handlers::wallet::delete))
+        .branch(case![Command::Receive].endpoint(handlers::onchain::receive))
+        .branch(case![Command::Balance].endpoint(handlers::onchain::balance))
+        .branch(case![Command::Addresses { page }].endpoint(handlers::onchain::addresses))
+        .branch(case![Command::History { page }].endpoint(handlers::onchain::history))
+        .branch(case![Command::Tx { txid }].endpoint(handlers::onchain::tx))
         .endpoint(handlers::start::not_yet);
 
     // §8.4: every state that expects text has exactly one endpoint, so
@@ -116,11 +128,21 @@ fn schema() -> teloxide::dispatching::UpdateHandler<anyhow::Error> {
         .branch(case![State::AwaitPin { pending }].endpoint(handlers::wallet::receive_pin))
         .branch(case![State::DeleteTypeConfirm].endpoint(handlers::wallet::receive_delete_word));
 
-    Update::filter_message()
+    let messages = Update::filter_message()
         .branch(dptree::filter_map(guard).endpoint(refuse))
         .enter_dialogue::<Message, SqliteDialogueStore, State>()
         .branch(commands)
-        .branch(states)
+        .branch(states);
+
+    // §8.5: callback data is `action:subject:arg`, and every id in it is one
+    // core minted — so a replayed button can only reference something core will
+    // re-validate or reject.
+    let callbacks = Update::filter_callback_query().branch(
+        dptree::filter(|q: CallbackQuery| q.data.as_deref() == Some("bal:refresh"))
+            .endpoint(handlers::onchain::refresh_balance),
+    );
+
+    dptree::entry().branch(messages).branch(callbacks)
 }
 
 /// Yields a refusal only when the message must not be served (§8.7); `None`

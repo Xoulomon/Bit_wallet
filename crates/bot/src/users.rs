@@ -53,6 +53,24 @@ impl UserStore {
         UserStore::new(Arc::new(Mutex::new(open_bot_db(path)?)))
     }
 
+    /// The chat to deliver a `CoreEvent` to (§8.6).
+    ///
+    /// In a private chat the chat id equals the user id, which is what makes
+    /// this a lookup rather than a second table.
+    pub fn chat_of(&self, user: UserId) -> Result<Option<i64>> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("user store mutex poisoned"))?;
+        db.query_row(
+            "SELECT tg_id FROM telegram_users WHERE user_id = ?1",
+            [user.to_string()],
+            |r| r.get(0),
+        )
+        .optional()
+        .context("reading telegram_users")
+    }
+
     /// The `UserId` for this Telegram id, minting one on first contact (§8.7).
     pub fn resolve(&self, tg_id: i64) -> Result<UserId> {
         let db = self

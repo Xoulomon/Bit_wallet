@@ -7,8 +7,11 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
+comfy-table = "8.0.0"
 dotenvy = "0.15.7"
 futures = "0.3.34"
+image = "0.25.9"
+qrcode = "0.14.1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

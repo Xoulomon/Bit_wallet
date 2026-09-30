@@ -125,6 +125,23 @@ impl Storage {
         Ok(found.is_some())
     }
 
+    /// Every user with a wallet, for the sync task to walk (§6).
+    pub fn all_users(&self) -> Result<Vec<UserId>> {
+        let db = self.lock()?;
+        let mut stmt = db.prepare("SELECT user_id FROM wallets")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+
+        let mut users = Vec::new();
+        for row in rows {
+            // A row that is not a UUID cannot have been written by us; skipping
+            // it is better than refusing to sync everyone else.
+            if let Ok(user) = row?.parse() {
+                users.push(user);
+            }
+        }
+        Ok(users)
+    }
+
     pub fn record(&self, user: UserId) -> Result<WalletRecord> {
         let db = self.lock()?;
         db.query_row(
