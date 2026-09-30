@@ -622,6 +622,7 @@ dependencies = [
  "comfy-table",
  "dotenvy",
  "futures",
+ "governor",
  "image",
  "qrcode",
  "rusqlite",

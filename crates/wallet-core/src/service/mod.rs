@@ -80,6 +80,19 @@ impl WalletService {
             "backend reachable"
         );
 
+        // §4: mainnet guardrails, checked once and loudly. `MAX_SEND_SATS` is
+        // not required, but running mainnet without one is a choice the
+        // operator should make on purpose rather than by omission.
+        if cfg.is_mainnet() {
+            match cfg.max_send {
+                Some(cap) => tracing::info!(cap_sats = cap.to_sat(), "mainnet send cap in force"),
+                None => tracing::warn!(
+                    "running on MAINNET with no MAX_SEND_SATS: a single command can spend \
+                     the whole balance"
+                ),
+            }
+        }
+
         std::fs::create_dir_all(cfg.network_dir())
             .map_err(|e| crate::error::CoreError::Storage(e.to_string()))?;
 
@@ -153,9 +166,25 @@ impl WalletService {
         })
     }
 
-    /// Stop the background sync task and let it finish its current pass.
-    pub fn shutdown(&self) {
+    /// Stop cleanly (§7 hardening).
+    ///
+    /// Signals the sync task, drops every unlocked session so no seed outlives
+    /// the process, and releases parked quotes. The wallet persisters are
+    /// flushed on every mutating call rather than here, which is the stronger
+    /// guarantee: a `kill -9` loses nothing either.
+    pub async fn shutdown(&self) {
         let _ = self.shutdown.send(true);
+
+        self.quotes.sweep();
+        if let Ok(users) = self.storage.all_users() {
+            for user in users {
+                self.sessions.lock(user);
+            }
+        }
+
+        // Give the current sync pass a moment to notice the flag.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tracing::info!("wallet service stopped");
     }
 
     /// Bring this user's wallet to the tip now, rather than at the next pass.

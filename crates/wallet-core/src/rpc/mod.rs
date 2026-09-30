@@ -10,6 +10,7 @@
 pub mod bitrpc;
 pub mod fees;
 pub mod polar;
+pub mod retry;
 
 use crate::{
     config::{AppConfig, BackendConfig},
@@ -125,10 +126,13 @@ impl ChainSource {
     /// and mainnet state is the one mistake that cannot be undone.
     pub fn health_check(&self) -> Result<Health> {
         let started = Instant::now();
-        let info = self
-            .client
-            .get_blockchain_info()
-            .map_err(map_rpc_error("getblockchaininfo"))?;
+        // A startup probe is exactly the call worth retrying: a 429 or a
+        // blinking node at boot would otherwise refuse to start the bot (§4b).
+        let info = retry::with_retry(|| {
+            self.client
+                .get_blockchain_info()
+                .map_err(map_rpc_error("getblockchaininfo"))
+        })?;
         let latency = started.elapsed();
 
         if info.chain != self.network {

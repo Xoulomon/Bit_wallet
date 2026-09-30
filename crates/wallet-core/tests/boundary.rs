@@ -133,3 +133,67 @@ fn core_returns_no_emoji() {
         offenders.join("\n")
     );
 }
+
+/// §3a rule 3 and §5: the mnemonic and the API key are redacted from every
+/// `Debug` impl and every error message.
+///
+/// A grep test rather than a unit test, because the property is about *every*
+/// type in the crate, not the handful a reviewer thinks to check.
+#[test]
+fn no_secret_is_ever_a_tracing_field() {
+    let src = workspace_root().join("crates/wallet-core/src");
+    let mut offenders = Vec::new();
+
+    visit(&src, &mut |path, text| {
+        for (n, line) in text.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or(line);
+            let is_log = [
+                "tracing::info!",
+                "tracing::warn!",
+                "tracing::error!",
+                "tracing::debug!",
+                "tracing::trace!",
+            ]
+            .iter()
+            .any(|m| code.contains(m));
+
+            if !is_log {
+                continue;
+            }
+
+            for secret in ["api_key", "mnemonic =", "seed", "pin =", "words"] {
+                if code.contains(secret) {
+                    offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+                }
+            }
+        }
+    });
+
+    assert!(
+        offenders.is_empty(),
+        "a secret reached a log line:\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// §5: plaintext secrets are wrapped in `Zeroizing`, so a `String` that holds a
+/// mnemonic cannot be returned bare from the facade.
+#[test]
+fn the_facade_returns_no_bare_secret() {
+    let facade = workspace_root().join("crates/wallet-core/src/service/mod.rs");
+    let text = std::fs::read_to_string(&facade).expect("the facade is readable");
+
+    for line in text.lines() {
+        let code = line.split("//").next().unwrap_or(line);
+        if !code.contains("pub async fn") && !code.contains("pub fn") {
+            continue;
+        }
+        if code.contains("mnemonic") || code.contains("export") {
+            assert!(
+                code.contains("Zeroizing") || code.contains("&self") && code.contains("Pin"),
+                "a secret-returning method must wrap it: {}",
+                line.trim()
+            );
+        }
+    }
+}

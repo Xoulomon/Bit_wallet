@@ -48,6 +48,8 @@ pub enum Refusal {
     NotAllowed,
     /// A channel post or a message with no author.
     NoSender,
+    /// Past the per-user command quota (§8.7).
+    TooFast,
 }
 
 impl Refusal {
@@ -60,6 +62,9 @@ impl Refusal {
             }
             Refusal::NotAllowed => "This bot is private and your account isn't on its list.",
             Refusal::NoSender => "I can't tell who sent that.",
+            Refusal::TooFast => {
+                "That's a lot of commands at once — give me a moment and try again."
+            }
         }
     }
 }

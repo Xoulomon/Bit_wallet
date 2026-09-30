@@ -11,6 +11,7 @@ mod commands;
 mod dialogue;
 mod handlers;
 mod notify;
+mod throttle;
 mod ui;
 mod users;
 
@@ -28,6 +29,9 @@ pub struct Ctx {
     pub core: Arc<WalletService>,
     pub users: Arc<users::UserStore>,
     pub policy: Arc<auth::Policy>,
+    /// §8.7: per-user *command* throttling, a separate concern from core's
+    /// RPC budget.
+    pub throttle: Arc<throttle::Throttle>,
 }
 
 #[tokio::main]
@@ -54,6 +58,7 @@ async fn main() -> Result<()> {
         core,
         users: Arc::new(users::UserStore::new(Arc::clone(&bot_conn))?),
         policy: Arc::new(auth::Policy::from_env()),
+        throttle: Arc::new(throttle::Throttle::new()),
     };
     let dialogues = SqliteDialogueStore::new(bot_conn)?;
 
@@ -74,8 +79,9 @@ async fn main() -> Result<()> {
         .dispatch()
         .await;
 
-    // Let the chain follower finish its pass and flush what it staged.
-    ctx.core.shutdown();
+    // Let the chain follower finish its pass, and drop every unlocked seed
+    // rather than leaving one in a process that is on its way out.
+    ctx.core.shutdown().await;
 
     Ok(())
 }
@@ -171,7 +177,16 @@ fn starts_with(prefix: &'static str) -> impl Fn(CallbackQuery) -> bool + Clone {
 /// Yields a refusal only when the message must not be served (§8.7); `None`
 /// lets it fall through to the command branch.
 fn guard(msg: Message, ctx: Ctx) -> Option<auth::Refusal> {
-    auth::check(&msg, &ctx.policy).err()
+    let (tg, _) = match auth::check(&msg, &ctx.policy) {
+        Ok(ok) => ok,
+        Err(refusal) => return Some(refusal),
+    };
+
+    #[allow(clippy::cast_possible_wrap)]
+    if !ctx.throttle.allow(tg.0 as i64) {
+        return Some(auth::Refusal::TooFast);
+    }
+    None
 }
 
 async fn refuse(bot: Bot, msg: Message, refusal: auth::Refusal) -> Result<()> {
