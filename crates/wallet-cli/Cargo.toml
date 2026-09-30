@@ -6,3 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow = "1.0.104"
+dotenvy = "0.15.7"
+rpassword = "7.5.4"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+wallet-core = { version = "0.1.0", path = "../wallet-core" }
+zeroize = "1.9.0"

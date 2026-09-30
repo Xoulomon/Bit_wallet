@@ -49,17 +49,24 @@ fn wallet_core_cannot_name_a_front_end_crate() {
     }
 }
 
-/// §3a: the bot is a *client*. It may hold a `Txid` or an `Amount`, but a
-/// `bdk_wallet` type, a `Psbt` or a `Mnemonic` in that crate means a capability
-/// grew around the facade instead of onto it.
+/// §3a: a front end is a *client*. It may hold a `Txid` or an `Amount`, but a
+/// `bdk_wallet` type, a `Psbt` or a `Mnemonic` in one means a capability grew
+/// around the facade instead of onto it.
+///
+/// Both front ends are checked, because the second one is the honest proof: the
+/// bot could have grown a shortcut nobody noticed, but `wallet-cli` was written
+/// against the same API and would have failed to compile.
 #[test]
-fn the_bot_crate_holds_no_wallet_internals() {
-    let bot_src = workspace_root().join("crates/bot/src");
-    if !bot_src.exists() {
-        // The "delete the front end and the wallet still builds" scenario.
-        return;
+fn the_front_ends_hold_no_wallet_internals() {
+    for crate_name in ["bot", "wallet-cli"] {
+        let src = workspace_root().join(format!("crates/{crate_name}/src"));
+        if src.exists() {
+            assert_no_internals(&src, crate_name);
+        }
     }
+}
 
+fn assert_no_internals(bot_src: &PathBuf, crate_name: &str) {
     // Whole identifiers, not substrings: the bot is free to *name* a core error
     // variant such as `CoreError::InvalidMnemonic` — what it may not do is hold
     // the type itself.
@@ -73,7 +80,7 @@ fn the_bot_crate_holds_no_wallet_internals() {
     ];
 
     let mut offenders = Vec::new();
-    visit(&bot_src, &mut |path, text| {
+    visit(bot_src, &mut |path, text| {
         for (n, line) in text.lines().enumerate() {
             let code = line.split("//").next().unwrap_or(line);
             let leaked = code
@@ -87,7 +94,7 @@ fn the_bot_crate_holds_no_wallet_internals() {
 
     assert!(
         offenders.is_empty(),
-        "wallet internals leaked into the bot crate:\n{}",
+        "wallet internals leaked into the {crate_name} crate:\n{}",
         offenders.join("\n")
     );
 }
@@ -195,5 +202,53 @@ fn the_facade_returns_no_bare_secret() {
                 line.trim()
             );
         }
+    }
+}
+
+/// §3a and §9 Step 8: every method on the facade is exercised by a front end or
+/// by a test. A method nothing calls is either dead or a capability the front
+/// ends had to work around — both worth knowing.
+#[test]
+fn the_second_front_end_reaches_the_facade_and_nothing_below_it() {
+    let cli = workspace_root().join("crates/wallet-cli/src/main.rs");
+    if !cli.exists() {
+        return;
+    }
+    let text = std::fs::read_to_string(&cli).expect("the CLI is readable");
+
+    // It must never name a private module of core.
+    for private in [
+        "onchain::",
+        "keys::",
+        "payjoin::",
+        "rpc::",
+        "session::",
+        "storage::",
+    ] {
+        assert!(
+            !text.contains(private),
+            "wallet-cli reached into `{private}` instead of the facade"
+        );
+    }
+
+    // And it must cover the capabilities that make it a real front end, not a
+    // sketch: if one of these is missing the boundary was never tested.
+    for method in [
+        "create_wallet",
+        "restore_wallet",
+        "unlock",
+        "next_address",
+        "balance",
+        "history",
+        "quote_send",
+        "confirm_send",
+        "payjoin_receive",
+        "subscribe",
+        "status",
+    ] {
+        assert!(
+            text.contains(method),
+            "wallet-cli does not exercise `{method}`, so the boundary is untested there"
+        );
     }
 }
