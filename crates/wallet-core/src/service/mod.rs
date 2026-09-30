@@ -16,10 +16,17 @@
 pub mod events;
 pub mod types;
 
-use crate::{config::AppConfig, error::Result, rpc::ChainSource};
+use crate::{
+    config::{AppConfig, BackendConfig},
+    error::{CoreError, Result},
+    keys,
+    rpc::ChainSource,
+    session::Sessions,
+    storage::Storage,
+};
 use bdk_wallet::bitcoin::{Address, Amount, BlockHash, FeeRate, Network, Txid};
 use events::{CoreEvent, EVENT_CHANNEL_CAPACITY};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::broadcast;
 use types::*;
 use zeroize::Zeroizing;
@@ -28,6 +35,8 @@ pub struct WalletService {
     cfg: AppConfig,
     chain: ChainSource,
     events: broadcast::Sender<CoreEvent>,
+    storage: Storage,
+    sessions: Sessions,
 }
 
 impl WalletService {
@@ -57,8 +66,16 @@ impl WalletService {
             .map_err(|e| crate::error::CoreError::Storage(e.to_string()))?;
 
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let storage = Storage::open(&cfg.app_db())?;
+        let sessions = Sessions::new(cfg.session_idle_timeout, events.clone());
 
-        Ok(Arc::new(WalletService { cfg, chain, events }))
+        Ok(Arc::new(WalletService {
+            cfg,
+            chain,
+            events,
+            storage,
+            sessions,
+        }))
     }
 
     /// Which chain this instance is bound to. Every front end reads this to
@@ -121,65 +138,220 @@ impl WalletService {
 
     /// MVP 1. Generates a mnemonic, seals it under the PIN, and returns it once
     /// together with the three word indices the user must read back (§5).
-    pub async fn create_wallet(&self, _u: UserId, _pin: &Pin) -> Result<NewWallet> {
-        todo!("Step 3: keys + vault")
+    ///
+    /// The birthday is the current tip, so creating a wallet on mainnet is
+    /// instant: there is nothing before it to scan (§6).
+    pub async fn create_wallet(&self, u: UserId, pin: &Pin) -> Result<NewWallet> {
+        self.check_pin_policy(pin)?;
+        if self.storage.wallet_exists(u)? {
+            return Err(CoreError::WalletExists);
+        }
+
+        let mnemonic = keys::generate()?;
+        let birthday = self.tip_height().await?;
+        let parsed = keys::parse(&mnemonic)?;
+        let challenge = keys::backup_challenge(parsed.words().count());
+
+        let vault = crate::crypto::seal(pin.expose(), &mnemonic)?;
+        self.storage
+            .insert_wallet(u, &vault, birthday, Some(challenge))?;
+
+        // Open the session straight away: the user has just proved they hold
+        // the PIN, and making them type it twice teaches nothing.
+        self.sessions.unlock(u, parsed);
+
+        tracing::info!(user = %u, birthday, "wallet created");
+
+        Ok(NewWallet {
+            user: u,
+            mnemonic,
+            confirm_challenge: challenge,
+            birthday,
+        })
     }
 
-    /// Verify the "confirm 3 words" challenge from `NewWallet` (§5). Core's rule,
-    /// not the front end's invention.
-    pub async fn confirm_backup(&self, _u: UserId, _answers: [String; 3]) -> Result<()> {
-        todo!("Step 3: keys + vault")
+    /// Verify the "confirm 3 words" challenge from `NewWallet` (§5).
+    ///
+    /// Core issued the challenge and core remembers it: the answers are checked
+    /// against the words core asked for, not against three the front end chose.
+    /// Requires an open session, because the check needs the mnemonic and the
+    /// user unlocked one moments ago by creating the wallet.
+    pub async fn confirm_backup(&self, u: UserId, answers: [String; 3]) -> Result<()> {
+        let Some(challenge) = self.storage.backup_challenge(u)? else {
+            // Nothing outstanding — either already confirmed, or restored.
+            return Ok(());
+        };
+
+        let correct = self
+            .sessions
+            .with_mnemonic(u, |m| keys::check_backup(m, challenge, &answers))
+            .ok_or(CoreError::Locked)?;
+
+        if !correct {
+            return Err(CoreError::BackupCheckFailed);
+        }
+
+        self.storage.mark_backup_confirmed(u)?;
+        Ok(())
     }
 
     /// MVP 2, first half: what a restore from this birthday would cost, and
     /// whether core will allow it at all (§6).
-    pub async fn restore_preflight(&self, _birthday: Option<u32>) -> Result<RestorePlan> {
-        todo!("Step 3: keys + vault")
+    pub async fn restore_preflight(&self, birthday: Option<u32>) -> Result<RestorePlan> {
+        let tip = self.tip_height().await?;
+        Ok(self.plan_restore(tip, birthday))
     }
 
     /// MVP 2. The words are deleted from the chat by the front end the moment
     /// they arrive; they reach core as `Zeroizing` and are never logged.
     pub async fn restore_wallet(
         &self,
-        _u: UserId,
-        _words: Zeroizing<String>,
-        _birthday: Option<u32>,
-        _pin: &Pin,
+        u: UserId,
+        words: Zeroizing<String>,
+        birthday: Option<u32>,
+        pin: &Pin,
     ) -> Result<()> {
-        todo!("Step 3: keys + vault")
+        self.check_pin_policy(pin)?;
+        if self.storage.wallet_exists(u)? {
+            return Err(CoreError::WalletExists);
+        }
+
+        // Validate before anything is written, so a typo leaves no half-made
+        // wallet behind.
+        let mnemonic = keys::parse(&words)?;
+
+        let tip = self.tip_height().await?;
+        let plan = self.plan_restore(tip, birthday);
+        if let RestoreVerdict::Refuse { max } = plan.verdict {
+            return Err(CoreError::RestoreTooDeep {
+                depth: plan.depth,
+                max,
+                eta: plan.eta,
+            });
+        }
+
+        let normalised = Zeroizing::new(mnemonic.to_string());
+        let vault = crate::crypto::seal(pin.expose(), &normalised)?;
+        self.storage.insert_wallet(u, &vault, plan.birthday, None)?;
+        // A restored wallet needs no backup quiz: the user already has the words.
+        self.storage.mark_backup_confirmed(u)?;
+        self.sessions.unlock(u, mnemonic);
+
+        tracing::info!(user = %u, birthday = plan.birthday, depth = plan.depth, "wallet restored");
+        Ok(())
     }
 
     /// `/export` (§8.2): reshow the mnemonic, PIN-gated.
-    pub async fn export_mnemonic(&self, _u: UserId, _pin: &Pin) -> Result<Zeroizing<String>> {
-        todo!("Step 3: keys + vault")
+    pub async fn export_mnemonic(&self, u: UserId, pin: &Pin) -> Result<Zeroizing<String>> {
+        self.storage.unseal(u, pin.expose())
     }
 
     /// `/delete` (§8.2). Destroys the vault and this user's wallet state.
-    pub async fn delete_wallet(&self, _u: UserId, _pin: &Pin) -> Result<()> {
-        todo!("Step 3: keys + vault")
+    ///
+    /// The PIN is required even though the record is about to be destroyed:
+    /// otherwise anyone who reached the chat could wipe a wallet whose owner
+    /// had not written the words down.
+    pub async fn delete_wallet(&self, u: UserId, pin: &Pin) -> Result<()> {
+        let _ = self.storage.unseal(u, pin.expose())?;
+        self.sessions.lock(u);
+        self.storage.delete_wallet(u)?;
+
+        let wallet_db = self.cfg.wallet_db(&u);
+        if wallet_db.exists() {
+            std::fs::remove_file(&wallet_db).map_err(|e| CoreError::Storage(e.to_string()))?;
+        }
+
+        tracing::info!(user = %u, "wallet deleted");
+        Ok(())
     }
 
-    pub fn wallet_exists(&self, _u: UserId) -> Result<bool> {
-        todo!("Step 3: keys + vault")
+    pub fn wallet_exists(&self, u: UserId) -> Result<bool> {
+        self.storage.wallet_exists(u)
     }
 
     // ------------------------------------------------------------------ session
 
     /// Open a session (§5). The seed stays in core until the idle timer expires
     /// or `lock` is called; the caller learns only that it worked.
-    pub async fn unlock(&self, _u: UserId, _pin: &Pin) -> Result<SessionInfo> {
-        todo!("Step 3: session cache")
+    pub async fn unlock(&self, u: UserId, pin: &Pin) -> Result<SessionInfo> {
+        let words = self.storage.unseal(u, pin.expose())?;
+        let mnemonic = keys::parse(&words)?;
+        Ok(self.sessions.unlock(u, mnemonic))
     }
 
-    pub fn lock(&self, _u: UserId) {
-        todo!("Step 3: session cache")
+    pub fn lock(&self, u: UserId) {
+        self.sessions.lock(u);
     }
 
     /// Whether a session is open and how long is left — never its contents.
-    pub fn session(&self, _u: UserId) -> Option<SessionInfo> {
-        todo!("Step 3: session cache")
+    pub fn session(&self, u: UserId) -> Option<SessionInfo> {
+        self.sessions.info(u)
     }
 
+    // ------------------------------------------------------------------ helpers
+
+    fn check_pin_policy(&self, pin: &Pin) -> Result<()> {
+        if pin.is_well_formed() {
+            Ok(())
+        } else {
+            Err(CoreError::InvalidPin { min: 6, max: 8 })
+        }
+    }
+
+    /// The current tip, through the active backend.
+    async fn tip_height(&self) -> Result<u32> {
+        let chain = ChainSource::connect(&self.cfg)?;
+        let health = tokio::task::spawn_blocking(move || chain.health_check())
+            .await
+            .map_err(|e| CoreError::Wallet(e.to_string()))??;
+        Ok(health.tip_height)
+    }
+
+    fn plan_restore(&self, tip: u32, birthday: Option<u32>) -> RestorePlan {
+        plan_restore(&self.cfg.backend, tip, birthday)
+    }
+}
+
+/// The restore-depth policy of §6, as a free function so §10 can test the
+/// arithmetic and the refusal without standing up a backend.
+///
+/// Regtest has no cap: there is nothing to scan, and a birthday of 0 on a
+/// hundred-block chain costs nothing.
+pub fn plan_restore(backend: &BackendConfig, tip: u32, birthday: Option<u32>) -> RestorePlan {
+    {
+        let birthday = birthday.unwrap_or(0).min(tip);
+        let depth = tip.saturating_sub(birthday);
+
+        // §6: ~2 calls per block at the sync budget, so roughly half the
+        // budget in blocks per minute.
+        let blocks_per_min = match backend {
+            BackendConfig::Bitrpc(b) => (b.sync_budget_per_min / 2).max(1),
+            BackendConfig::Regtest(_) => 600,
+        };
+        let eta = Duration::from_secs(u64::from(depth) * 60 / u64::from(blocks_per_min));
+
+        let verdict = match backend {
+            BackendConfig::Regtest(_) => RestoreVerdict::Proceed,
+            BackendConfig::Bitrpc(b) if depth > b.max_rescan_blocks => RestoreVerdict::Refuse {
+                max: b.max_rescan_blocks,
+            },
+            // Under ~2 000 blocks it proceeds silently; beyond that the user
+            // should see the ETA before committing to it.
+            BackendConfig::Bitrpc(_) if depth > 2_000 => RestoreVerdict::Warn,
+            BackendConfig::Bitrpc(_) => RestoreVerdict::Proceed,
+        };
+
+        RestorePlan {
+            birthday,
+            tip,
+            depth,
+            eta,
+            verdict,
+        }
+    }
+}
+
+impl WalletService {
     // -------------------------------------------------- watch-only (no PIN)
 
     /// MVP 4. `/receive`: the next unused external address (§6).
@@ -269,5 +441,104 @@ impl WalletService {
     /// call it, core decides *whether it exists*.
     pub async fn mine(&self, _blocks: u32, _to: Option<Address>) -> Result<Vec<BlockHash>> {
         todo!("Step 5: send (regtest mining helper)")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{BitrpcConfig, RegtestConfig};
+
+    fn bitrpc(max_rescan: u32) -> BackendConfig {
+        BackendConfig::Bitrpc(BitrpcConfig {
+            url: "https://example.invalid".into(),
+            api_key: Zeroizing::new("k".into()),
+            rate_limit_per_min: 90,
+            sync_budget_per_min: 60,
+            max_rescan_blocks: max_rescan,
+            min_fee: FeeRate::from_sat_per_vb(1).expect("a valid rate"),
+            fee_api: "https://example.invalid".into(),
+            payjoin_directory: "https://example.invalid".into(),
+            ohttp_relay: "https://example.invalid".into(),
+        })
+    }
+
+    fn regtest() -> BackendConfig {
+        BackendConfig::Regtest(RegtestConfig {
+            rpc_url: "http://127.0.0.1:18443".into(),
+            rpc_user: "polaruser".into(),
+            rpc_pass: Zeroizing::new("polarpass".into()),
+            payjoin_directory: "http://localhost:8080".into(),
+            ohttp_relay: "http://localhost:3000".into(),
+            fallback_fee: FeeRate::from_sat_per_vb(2).expect("a valid rate"),
+        })
+    }
+
+    #[test]
+    fn a_shallow_restore_proceeds_without_comment() {
+        let plan = plan_restore(&bitrpc(10_000), 900_000, Some(899_500));
+        assert_eq!(plan.depth, 500);
+        assert_eq!(plan.verdict, RestoreVerdict::Proceed);
+    }
+
+    #[test]
+    fn a_deep_but_allowed_restore_warns_with_an_eta() {
+        let plan = plan_restore(&bitrpc(10_000), 900_000, Some(895_000));
+        assert_eq!(plan.depth, 5_000);
+        assert_eq!(plan.verdict, RestoreVerdict::Warn);
+        // §6: ~30 blocks/min at the default sync budget, so 5 000 blocks is
+        // about two and a half hours — worth saying before it starts.
+        assert!(plan.eta >= Duration::from_secs(2 * 3600));
+    }
+
+    /// §6: beyond the cap it refuses, quoting the computed ETA and the maximum.
+    #[test]
+    fn a_restore_past_the_cap_is_refused_with_the_numbers_that_justify_it() {
+        let plan = plan_restore(&bitrpc(10_000), 900_000, Some(400_000));
+        assert_eq!(plan.depth, 500_000);
+        match plan.verdict {
+            RestoreVerdict::Refuse { max } => assert_eq!(max, 10_000),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        // A full SegWit-era rescan is hundreds of hours, which is why the cap
+        // exists rather than a progress bar.
+        assert!(plan.eta > Duration::from_secs(100 * 3600));
+    }
+
+    #[test]
+    fn the_cap_is_exact_rather_than_approximate() {
+        let at_limit = plan_restore(&bitrpc(10_000), 900_000, Some(890_000));
+        assert_eq!(at_limit.depth, 10_000);
+        assert_eq!(
+            at_limit.verdict,
+            RestoreVerdict::Warn,
+            "the cap itself is allowed"
+        );
+
+        let one_over = plan_restore(&bitrpc(10_000), 900_000, Some(889_999));
+        assert!(matches!(one_over.verdict, RestoreVerdict::Refuse { .. }));
+    }
+
+    #[test]
+    fn regtest_has_no_cap() {
+        let plan = plan_restore(&regtest(), 900_000, Some(0));
+        assert_eq!(plan.depth, 900_000);
+        assert_eq!(plan.verdict, RestoreVerdict::Proceed);
+    }
+
+    #[test]
+    fn a_missing_birthday_means_scan_from_genesis() {
+        let plan = plan_restore(&regtest(), 101, None);
+        assert_eq!(plan.birthday, 0);
+        assert_eq!(plan.depth, 101);
+    }
+
+    #[test]
+    fn a_birthday_in_the_future_is_clamped_to_the_tip() {
+        // A user who mistypes a height must not end up with a negative depth
+        // or a wallet that skips its own history.
+        let plan = plan_restore(&regtest(), 101, Some(500_000));
+        assert_eq!(plan.birthday, 101);
+        assert_eq!(plan.depth, 0);
     }
 }

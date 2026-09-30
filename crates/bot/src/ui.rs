@@ -131,6 +131,8 @@ pub fn render_error(e: &CoreError) -> String {
             "You don't have a wallet yet. /create makes one, /restore brings an existing seed phrase.".into(),
         CoreError::WalletExists =>
             "You already have a wallet here. /delete removes it first — make sure your seed phrase is written down.".into(),
+        CoreError::BackupCheckFailed =>
+            "Those words don't match. Check the numbered words against what you wrote down, then try again.".into(),
         CoreError::InvalidMnemonic =>
             "That isn't a valid seed phrase. Check the spelling and the word order, then try /restore again.".into(),
         CoreError::InvalidPin { min, max } =>

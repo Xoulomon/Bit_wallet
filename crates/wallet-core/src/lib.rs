@@ -16,9 +16,13 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod crypto;
 pub mod error;
+pub mod keys;
 pub mod rpc;
 pub mod service;
+pub mod session;
+pub mod storage;
 
 pub use config::{AppConfig, NetworkChoice};
 pub use error::{BackendError, CoreError};

@@ -50,6 +50,10 @@ pub enum CoreError {
     #[error("invalid mnemonic")]
     InvalidMnemonic,
 
+    /// The three words read back did not match the challenge core issued (§5).
+    #[error("the words read back do not match")]
+    BackupCheckFailed,
+
     /// The PIN does not satisfy the policy in §5 (6–8 digits).
     #[error("PIN must be {min}-{max} digits")]
     InvalidPin { min: usize, max: usize },
