@@ -39,6 +39,21 @@ pub struct WalletService {
     sessions: Sessions,
     /// Stops the sync task. Step 7 flushes persisters on the way out.
     shutdown: tokio::sync::watch::Sender<bool>,
+    fees: Arc<crate::rpc::fees::FeePolicy>,
+    /// Drafted payments awaiting a human (§3a rule 4).
+    quotes: crate::onchain::quotes::Quotes,
+}
+
+/// A fee bump keeps the original recipient; find it among the outputs that are
+/// not ours.
+fn wallet_recipient(draft: &crate::onchain::wallet::Draft, network: Network) -> Result<Address> {
+    draft
+        .psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .find_map(|o| Address::from_script(&o.script_pubkey, network).ok())
+        .ok_or_else(|| CoreError::Wallet("the replacement has no recognisable output".into()))
 }
 
 impl WalletService {
@@ -71,6 +86,7 @@ impl WalletService {
         let storage = Arc::new(Storage::open(&cfg.app_db())?);
         let sessions = Sessions::new(cfg.session_idle_timeout, events.clone());
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let cfg_for_fees = cfg.clone();
 
         // One follower for every wallet: a block is fetched once, however many
         // users there are (§6).
@@ -85,9 +101,11 @@ impl WalletService {
             cfg,
             chain,
             events,
+            fees: Arc::new(crate::rpc::fees::FeePolicy::new(&cfg_for_fees)),
             storage,
             sessions,
             shutdown: shutdown_tx,
+            quotes: crate::onchain::quotes::Quotes::new(),
         }))
     }
 
@@ -444,38 +462,191 @@ impl WalletService {
 
     /// Parse an address or a BIP21 URI, including `pj=` and `pjos=0` (§6, §7).
     /// Pure and synchronous: a front end can validate as the user types.
-    pub fn parse_payment(&self, _input: &str) -> Result<PaymentTarget> {
-        todo!("Step 5: send")
+    pub fn parse_payment(&self, input: &str) -> Result<PaymentTarget> {
+        crate::onchain::payment::parse(input, self.network())
     }
 
     /// The fee presets, floor and source for this network, flattened so the
     /// front end's fee keyboard is the same code on both (§6).
     pub async fn fee_options(&self) -> Result<FeeOptions> {
-        todo!("Step 5: send")
+        let fees = Arc::clone(&self.fees);
+        tokio::task::spawn_blocking(move || fees.options())
+            .await
+            .map_err(|e| CoreError::Wallet(e.to_string()))?
     }
 
     /// MVP 8, first half. Builds and prices a PSBT that stays inside core; the
     /// caller gets plain numbers and an id (§3a rule 4).
-    pub async fn quote_send(&self, _u: UserId, _req: SendRequest) -> Result<SendQuote> {
-        todo!("Step 5: send")
+    pub async fn quote_send(&self, u: UserId, req: SendRequest) -> Result<SendQuote> {
+        let recipient = req
+            .target
+            .address
+            .clone()
+            .require_network(self.network())
+            .map_err(|_| CoreError::InvalidPaymentTarget {
+                network: self.network(),
+            })?;
+
+        // Every rate, estimated or typed, meets the floor (§6).
+        let fees = Arc::clone(&self.fees);
+        let floor = tokio::task::spawn_blocking(move || fees.floor())
+            .await
+            .map_err(|e| CoreError::Wallet(e.to_string()))?;
+        crate::rpc::fees::check_rate(req.fee_rate, floor)?;
+
+        if let (SendAmount::Exact(amount), Some(cap)) = (req.amount, self.cfg.max_send)
+            && amount > cap
+        {
+            return Err(CoreError::OverSendCap { amount, cap });
+        }
+
+        let mut wallet = self.open_wallet(u)?;
+        let draft = wallet.draft(&recipient, req.amount, req.fee_rate)?;
+
+        // The cap again, now that `max` has a number.
+        if let Some(cap) = self.cfg.max_send
+            && draft.amount > cap
+        {
+            return Err(CoreError::OverSendCap {
+                amount: draft.amount,
+                cap,
+            });
+        }
+
+        let quote = SendQuote {
+            id: QuoteId::new(),
+            recipient,
+            amount: draft.amount,
+            fee: draft.fee,
+            fee_rate: req.fee_rate,
+            total: draft.amount + draft.fee,
+            change: draft.change,
+            is_payjoin: req.target.payjoin_endpoint.is_some(),
+            replaces: None,
+            expires_at: std::time::SystemTime::now() + crate::onchain::quotes::QUOTE_TTL,
+        };
+
+        self.quotes.park(u, quote.clone(), draft.psbt);
+        Ok(quote)
     }
 
     /// MVP 8 + 9, second half. Signs the quoted PSBT and broadcasts it.
-    /// Re-validates the quote: expiry and ownership are checked here, so a
-    /// replayed button cannot move money (§8.5).
-    pub async fn confirm_send(&self, _u: UserId, _q: QuoteId, _auth: Auth) -> Result<Broadcast> {
-        todo!("Step 5: send")
+    ///
+    /// The quote is re-validated here — expiry and ownership are checked by the
+    /// store — so a replayed button cannot move money (§8.5). A `Pin` opens a
+    /// session first, which is why a user who unlocked a minute ago is not
+    /// asked again.
+    pub async fn confirm_send(&self, u: UserId, q: QuoteId, auth: Auth) -> Result<Broadcast> {
+        if let Auth::Pin(pin) = &auth {
+            self.unlock(u, pin).await?;
+        }
+
+        let (quote, mut psbt) = self.quotes.take(u, q)?;
+
+        let mut wallet = self.open_wallet(u)?;
+        self.sessions
+            .with_mnemonic(u, |m| wallet.sign(&mut psbt, m))
+            .ok_or(CoreError::Locked)??;
+
+        let tx = psbt
+            .extract_tx()
+            .map_err(|e| CoreError::Wallet(e.to_string()))?;
+
+        self.broadcast(&tx).await?;
+
+        // §6 step 6: insert it as unconfirmed at once. On mainnet this is the
+        // only way an outgoing payment shows before a block lands.
+        let txid = tx.compute_txid();
+        wallet.record_broadcast(tx)?;
+
+        tracing::info!(user = %u, %txid, "broadcast");
+
+        Ok(Broadcast {
+            txid,
+            amount: quote.amount,
+            fee: quote.fee,
+            payjoin: false,
+        })
     }
 
     /// Drop a quote the user cancelled, so its PSBT and its inputs are released.
-    pub async fn cancel_quote(&self, _u: UserId, _q: QuoteId) {
-        todo!("Step 5: send")
+    pub async fn cancel_quote(&self, u: UserId, q: QuoteId) {
+        self.quotes.cancel(u, q);
     }
 
     /// `/bumpfee` (§6). Returns the same `SendQuote` shape, so the confirm card
     /// is the same code — only the header differs.
-    pub async fn bump_fee(&self, _u: UserId, _txid: Txid, _rate: FeeRate) -> Result<SendQuote> {
-        todo!("Step 5: send")
+    pub async fn bump_fee(&self, u: UserId, txid: Txid, rate: FeeRate) -> Result<SendQuote> {
+        let fees = Arc::clone(&self.fees);
+        let floor = tokio::task::spawn_blocking(move || fees.floor())
+            .await
+            .map_err(|e| CoreError::Wallet(e.to_string()))?;
+        crate::rpc::fees::check_rate(rate, floor)?;
+
+        let mut wallet = self.open_wallet(u)?;
+        let draft = wallet.draft_fee_bump(txid, rate)?;
+
+        let recipient = wallet_recipient(&draft, self.network())?;
+        let quote = SendQuote {
+            id: QuoteId::new(),
+            recipient,
+            amount: draft.amount,
+            fee: draft.fee,
+            fee_rate: rate,
+            total: draft.amount + draft.fee,
+            change: draft.change,
+            is_payjoin: false,
+            replaces: Some(txid),
+            expires_at: std::time::SystemTime::now() + crate::onchain::quotes::QUOTE_TTL,
+        };
+
+        self.quotes.park(u, quote.clone(), draft.psbt);
+        Ok(quote)
+    }
+
+    /// Send a raw transaction, with the dry run where one exists (§6 step 5).
+    async fn broadcast(&self, tx: &bdk_wallet::bitcoin::Transaction) -> Result<()> {
+        let cfg = self.cfg.clone();
+        let raw = bdk_wallet::bitcoin::consensus::encode::serialize_hex(tx);
+        let dry_run = self.chain.capabilities().test_mempool_accept;
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            use bitcoincore_rpc::RpcApi as _;
+            let source = ChainSource::connect(&cfg)?;
+            let client = source.client();
+
+            // Regtest gets the real dry run; mainnet has no testmempoolaccept
+            // on the allowlist, so its rejection arrives from the broadcast
+            // itself — which is why that reason is surfaced verbatim (§4b).
+            if dry_run {
+                let results = client
+                    .test_mempool_accept(std::slice::from_ref(&raw))
+                    .map_err(crate::rpc::map_rpc_error("testmempoolaccept"))?;
+                if let Some(first) = results.first()
+                    && !first.allowed
+                {
+                    return Err(CoreError::BroadcastRejected {
+                        reason: first
+                            .reject_reason
+                            .clone()
+                            .unwrap_or_else(|| "rejected by the node".into()),
+                    });
+                }
+            }
+
+            client.send_raw_transaction(raw).map_err(|e| {
+                match crate::rpc::map_rpc_error("sendrawtransaction")(e) {
+                    // The node's own words are the useful part here (§6).
+                    CoreError::Backend(crate::error::BackendError::Rpc { message, .. }) => {
+                        CoreError::BroadcastRejected { reason: message }
+                    }
+                    other => other,
+                }
+            })?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| CoreError::Wallet(e.to_string()))?
     }
 
     // ------------------------------------------------------------------ payjoin
@@ -498,8 +669,34 @@ impl WalletService {
 
     /// `/mine` (§8.2). Core refuses off regtest; the front end decides *who* may
     /// call it, core decides *whether it exists*.
-    pub async fn mine(&self, _blocks: u32, _to: Option<Address>) -> Result<Vec<BlockHash>> {
-        todo!("Step 5: send (regtest mining helper)")
+    pub async fn mine(&self, blocks: u32, to: Option<Address>) -> Result<Vec<BlockHash>> {
+        if !self.chain.capabilities().mining {
+            return Err(CoreError::UnsupportedOnNetwork {
+                network: self.network(),
+            });
+        }
+
+        let cfg = self.cfg.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<BlockHash>> {
+            use bitcoincore_rpc::RpcApi as _;
+            let source = ChainSource::connect(&cfg)?;
+            let client = source.client();
+
+            let address = match to {
+                Some(a) => a,
+                None => client
+                    .get_new_address(None, None)
+                    .map_err(crate::rpc::map_rpc_error("getnewaddress"))?
+                    .require_network(cfg.network.network())
+                    .map_err(|e| CoreError::Wallet(e.to_string()))?,
+            };
+
+            client
+                .generate_to_address(u64::from(blocks), &address)
+                .map_err(crate::rpc::map_rpc_error("generatetoaddress"))
+        })
+        .await
+        .map_err(|e| CoreError::Wallet(e.to_string()))?
     }
 }
 

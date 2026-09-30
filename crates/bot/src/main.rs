@@ -104,6 +104,9 @@ fn schema() -> teloxide::dispatching::UpdateHandler<anyhow::Error> {
         .branch(case![Command::Addresses { page }].endpoint(handlers::onchain::addresses))
         .branch(case![Command::History { page }].endpoint(handlers::onchain::history))
         .branch(case![Command::Tx { txid }].endpoint(handlers::onchain::tx))
+        .branch(case![Command::Send { args }].endpoint(handlers::send::send))
+        .branch(case![Command::Bumpfee { txid }].endpoint(handlers::send::bump_fee))
+        .branch(case![Command::Mine { blocks }].endpoint(handlers::admin::mine))
         .endpoint(handlers::start::not_yet);
 
     // §8.4: every state that expects text has exactly one endpoint, so
@@ -126,7 +129,11 @@ fn schema() -> teloxide::dispatching::UpdateHandler<anyhow::Error> {
             .endpoint(handlers::wallet::receive_backup_word),
         )
         .branch(case![State::AwaitPin { pending }].endpoint(handlers::wallet::receive_pin))
-        .branch(case![State::DeleteTypeConfirm].endpoint(handlers::wallet::receive_delete_word));
+        .branch(case![State::DeleteTypeConfirm].endpoint(handlers::wallet::receive_delete_word))
+        .branch(
+            case![State::AwaitCustomFee { target, amount }]
+                .endpoint(handlers::send::receive_custom_fee),
+        );
 
     let messages = Update::filter_message()
         .branch(dptree::filter_map(guard).endpoint(refuse))
@@ -137,12 +144,25 @@ fn schema() -> teloxide::dispatching::UpdateHandler<anyhow::Error> {
     // §8.5: callback data is `action:subject:arg`, and every id in it is one
     // core minted — so a replayed button can only reference something core will
     // re-validate or reject.
-    let callbacks = Update::filter_callback_query().branch(
-        dptree::filter(|q: CallbackQuery| q.data.as_deref() == Some("bal:refresh"))
-            .endpoint(handlers::onchain::refresh_balance),
-    );
+    let callbacks = Update::filter_callback_query()
+        .branch(
+            dptree::filter(|q: CallbackQuery| q.data.as_deref() == Some("bal:refresh"))
+                .endpoint(handlers::onchain::refresh_balance),
+        )
+        .enter_dialogue::<CallbackQuery, SqliteDialogueStore, State>()
+        .branch(dptree::filter(starts_with("send:fee:")).branch(
+            case![State::AwaitFeeChoice { target, amount }].endpoint(handlers::send::choose_fee),
+        ))
+        .branch(dptree::filter(starts_with("send:confirm:")).endpoint(handlers::send::confirm))
+        .branch(dptree::filter(starts_with("send:cancel:")).endpoint(handlers::send::cancel));
 
     dptree::entry().branch(messages).branch(callbacks)
+}
+
+/// §8.5: `action:subject:arg`. Matching on the prefix keeps the routing in one
+/// place and the ids opaque.
+fn starts_with(prefix: &'static str) -> impl Fn(CallbackQuery) -> bool + Clone {
+    move |q: CallbackQuery| q.data.as_deref().is_some_and(|d| d.starts_with(prefix))
 }
 
 /// Yields a refusal only when the message must not be served (§8.7); `None`

@@ -7,6 +7,7 @@
 //! Loading is deliberately explicit rather than cached: a wallet is opened,
 //! read, and dropped. The shared thing is the chain data, not the handles.
 
+use crate::service::types::SendAmount;
 use crate::{
     error::{CoreError, Result},
     keys,
@@ -21,6 +22,13 @@ use bdk_wallet::{
     keys::bip39::Mnemonic,
     rusqlite::Connection,
 };
+use bdk_wallet::{
+    SignOptions,
+    bitcoin::{FeeRate, Psbt},
+    descriptor::IntoWalletDescriptor,
+    signer::SignersContainer,
+};
+
 use std::{
     path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -310,6 +318,172 @@ fn rank(status: &TxStatus) -> (u8, u32) {
 /// about it without a system clock.
 pub fn now() -> SystemTime {
     SystemTime::now()
+}
+
+// ------------------------------------------------------------------- spending
+// MVP 8 and 9 (PLAN.md §6 steps 3–6). The two halves are deliberately apart:
+// `draft` is pure and needs no PIN, `sign` needs the seed and nothing else.
+
+/// What a drafted payment costs, before anyone has agreed to it.
+pub struct Draft {
+    pub psbt: Psbt,
+    pub amount: Amount,
+    pub fee: Amount,
+    pub change: Amount,
+}
+
+impl OpenWallet {
+    /// Build and price a payment (§6 step 3).
+    ///
+    /// Default BnB coin selection, RBF enabled (the default since BDK 1.x) and
+    /// `drain_wallet` for `max`. Nothing is signed and nothing is persisted:
+    /// a quote the user abandons must leave no trace.
+    pub fn draft(
+        &mut self,
+        recipient: &Address,
+        amount: SendAmount,
+        fee_rate: FeeRate,
+    ) -> Result<Draft> {
+        let script = recipient.script_pubkey();
+
+        let psbt = {
+            let mut builder = self.wallet.build_tx();
+            builder.fee_rate(fee_rate);
+
+            match amount {
+                SendAmount::Exact(value) => {
+                    builder.add_recipient(script.clone(), value);
+                }
+                // `max`: every coin goes to the recipient and there is no change.
+                SendAmount::Max => {
+                    builder.drain_wallet();
+                    builder.drain_to(script.clone());
+                }
+            }
+
+            builder.finish().map_err(map_build_error)?
+        };
+
+        let fee = psbt.fee().map_err(|e| CoreError::Wallet(e.to_string()))?;
+
+        let unsigned = &psbt.unsigned_tx;
+        let to_recipient: Amount = unsigned
+            .output
+            .iter()
+            .filter(|o| o.script_pubkey == script)
+            .map(|o| o.value)
+            .sum();
+        let change: Amount = unsigned
+            .output
+            .iter()
+            .filter(|o| o.script_pubkey != script)
+            .map(|o| o.value)
+            .sum();
+
+        Ok(Draft {
+            psbt,
+            amount: to_recipient,
+            fee,
+            change,
+        })
+    }
+
+    /// Raise the fee on a stuck transaction (§6 stretch).
+    ///
+    /// This matters more on mainnet than the plan first assumed, because there
+    /// is no fee estimator to get the first attempt right.
+    pub fn draft_fee_bump(&mut self, txid: Txid, fee_rate: FeeRate) -> Result<Draft> {
+        let psbt = {
+            let mut builder = self
+                .wallet
+                .build_fee_bump(txid)
+                .map_err(|e| CoreError::Wallet(e.to_string()))?;
+            builder.fee_rate(fee_rate);
+            builder.finish().map_err(map_build_error)?
+        };
+
+        let fee = psbt.fee().map_err(|e| CoreError::Wallet(e.to_string()))?;
+        let change: Amount = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .filter(|o| self.wallet.is_mine(o.script_pubkey.clone()))
+            .map(|o| o.value)
+            .sum();
+        let amount: Amount = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .filter(|o| !self.wallet.is_mine(o.script_pubkey.clone()))
+            .map(|o| o.value)
+            .sum();
+
+        Ok(Draft {
+            psbt,
+            amount,
+            fee,
+            change,
+        })
+    }
+
+    /// Sign a drafted PSBT with signers built from the seed (§5, §6 step 5).
+    ///
+    /// The keys are derived, used and dropped inside this call. BDK 3.x is
+    /// explicit that the `Wallet` is no longer a key store, which suits the
+    /// design here exactly: the persisted wallet stays watch-only and the
+    /// signers are owned by this stack frame and nothing else.
+    pub fn sign(&self, psbt: &mut Psbt, mnemonic: &Mnemonic) -> Result<()> {
+        let secret = keys::private_descriptors(mnemonic, self.network)?;
+        let secp = self.wallet.secp_ctx();
+
+        let container = |descriptor: &str| -> Result<SignersContainer> {
+            let (parsed, keymap) = descriptor
+                .to_string()
+                .into_wallet_descriptor(secp, self.network.into())
+                .map_err(|e| CoreError::Wallet(e.to_string()))?;
+            Ok(SignersContainer::build(keymap, &parsed, secp))
+        };
+
+        let external = container(&secret.external)?;
+        let internal = container(&secret.internal)?;
+
+        let finalized = self
+            .wallet
+            .sign_with_signers(psbt, &[&external, &internal], SignOptions::default())
+            .map_err(|e| CoreError::Wallet(e.to_string()))?;
+
+        if !finalized {
+            return Err(CoreError::Wallet(
+                "the transaction could not be fully signed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Record a broadcast transaction as unconfirmed, so it shows as pending at
+    /// once — on mainnet this is the *only* way an outgoing payment appears
+    /// before a block, since there is no mempool to read (§4b, §6).
+    pub fn record_broadcast(&mut self, tx: bdk_wallet::bitcoin::Transaction) -> Result<()> {
+        let seen = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.wallet.apply_unconfirmed_txs([(tx, seen)]);
+        self.flush()
+    }
+}
+
+/// Coin selection failures deserve their own variant: "not enough money" is a
+/// different conversation from "something went wrong" (§8.1).
+fn map_build_error(e: bdk_wallet::error::CreateTxError) -> CoreError {
+    use bdk_wallet::error::CreateTxError;
+    match e {
+        CreateTxError::CoinSelection(inner) => CoreError::InsufficientFunds {
+            needed: Amount::from_sat(inner.needed.to_sat()),
+            available: Amount::from_sat(inner.available.to_sat()),
+        },
+        other => CoreError::Wallet(other.to_string()),
+    }
 }
 
 #[cfg(test)]

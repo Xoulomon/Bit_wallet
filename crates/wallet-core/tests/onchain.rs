@@ -334,3 +334,256 @@ async fn storage_lists_every_user_for_the_sync_task() {
         assert!(listed.contains(&user));
     }
 }
+
+// ------------------------------------------------------------------- spending
+// MVP 8 and 9 (PLAN.md §10): a real transaction, built, signed and broadcast
+// against a real node.
+
+use wallet_core::service::types::SendAmount;
+
+/// Fund a wallet and return its first address plus the miner's, so a test can
+/// keep mining.
+async fn funded(
+    h: &Harness,
+    user: UserId,
+    words: &str,
+    sats: u64,
+) -> wallet_core::bitcoin::Address {
+    let address = {
+        let mut w = make_wallet(&h.cfg, user, words);
+        w.next_address().expect("reveals").address
+    };
+    let miner = h.node.client.new_address().expect("node address");
+    h.node
+        .client
+        .generate_to_address(101, &miner)
+        .expect("mines");
+    h.node
+        .client
+        .send_to_address(&address, Amount::from_sat(sats))
+        .expect("funds");
+    h.node
+        .client
+        .generate_to_address(1, &miner)
+        .expect("confirms");
+    wallet_core::onchain::sync::sync_now(&h.cfg, user)
+        .await
+        .expect("syncs");
+    miner
+}
+
+/// MVP 8 + 9: build, sign and broadcast, then see it confirm.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_payment_between_two_wallets_is_signed_broadcast_and_confirmed() {
+    let h = harness();
+    let alice = UserId::new();
+    let bob = UserId::new();
+
+    let miner = funded(&h, alice, MNEMONIC, 500_000).await;
+
+    let bob_address = {
+        let mut w = make_wallet(&h.cfg, bob, OTHER_MNEMONIC);
+        w.next_address().expect("reveals").address
+    };
+
+    let rate = wallet_core::bitcoin::FeeRate::from_sat_per_vb(2).expect("valid");
+    let mnemonic = wallet_core::keys::parse(MNEMONIC).expect("parses");
+
+    let (txid, quoted_amount) = {
+        let mut w =
+            wallet_core::onchain::OpenWallet::load(&h.cfg.wallet_db(&alice), Network::Regtest)
+                .expect("loads");
+
+        let draft = w
+            .draft(
+                &bob_address,
+                SendAmount::Exact(Amount::from_sat(120_000)),
+                rate,
+            )
+            .expect("drafts");
+
+        assert_eq!(draft.amount, Amount::from_sat(120_000));
+        assert!(draft.fee > Amount::ZERO, "a real transaction pays a fee");
+        assert!(draft.change > Amount::ZERO, "the rest comes back as change");
+
+        let mut psbt = draft.psbt;
+        w.sign(&mut psbt, &mnemonic).expect("signs");
+
+        let tx = psbt.extract_tx().expect("the PSBT is final");
+        let txid = h
+            .node
+            .client
+            .send_raw_transaction(&tx)
+            .expect("the node accepts it");
+
+        w.record_broadcast(tx).expect("records it as pending");
+        (txid.txid().expect("a txid"), draft.amount)
+    };
+
+    // Before a block, Alice sees it as pending; the money has left.
+    {
+        let w = wallet_core::onchain::OpenWallet::load(&h.cfg.wallet_db(&alice), Network::Regtest)
+            .expect("loads");
+        let history = w.history(0, Page::new(0)).expect("lists");
+        assert!(
+            history.items.iter().any(|t| t.txid == txid),
+            "the broadcast transaction shows at once"
+        );
+    }
+
+    h.node
+        .client
+        .generate_to_address(1, &miner)
+        .expect("confirms");
+
+    let tip = wallet_core::onchain::sync::sync_now(&h.cfg, alice)
+        .await
+        .expect("syncs alice");
+    wallet_core::onchain::sync::sync_now(&h.cfg, bob)
+        .await
+        .expect("syncs bob");
+
+    // Bob has the money.
+    let b = wallet_core::onchain::OpenWallet::load(&h.cfg.wallet_db(&bob), Network::Regtest)
+        .expect("loads");
+    assert_eq!(b.balance(true).confirmed, quoted_amount);
+
+    // And Alice's copy is confirmed, with the fee accounted for.
+    let a = wallet_core::onchain::OpenWallet::load(&h.cfg.wallet_db(&alice), Network::Regtest)
+        .expect("loads");
+    let detail = a.tx(txid, tip).expect("alice knows the transaction");
+    match detail.summary.status {
+        TxStatus::Confirmed { confirmations, .. } => assert_eq!(confirmations, 1),
+        other => panic!("expected a confirmation, got {other:?}"),
+    }
+    assert!(
+        detail.summary.fee.is_some(),
+        "the fee is known to the sender"
+    );
+    assert!(
+        a.balance(true).confirmed < Amount::from_sat(500_000 - 120_000),
+        "the fee came out of Alice's balance too"
+    );
+}
+
+/// `/send <addr> max` drains the wallet: everything goes, and no change is left.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_max_payment_drains_the_wallet() {
+    let h = harness();
+    let alice = UserId::new();
+    let bob = UserId::new();
+
+    let miner = funded(&h, alice, MNEMONIC, 300_000).await;
+
+    let bob_address = {
+        let mut w = make_wallet(&h.cfg, bob, OTHER_MNEMONIC);
+        w.next_address().expect("reveals").address
+    };
+
+    let rate = wallet_core::bitcoin::FeeRate::from_sat_per_vb(2).expect("valid");
+    let mnemonic = wallet_core::keys::parse(MNEMONIC).expect("parses");
+
+    {
+        let mut w =
+            wallet_core::onchain::OpenWallet::load(&h.cfg.wallet_db(&alice), Network::Regtest)
+                .expect("loads");
+        let draft = w
+            .draft(&bob_address, SendAmount::Max, rate)
+            .expect("drafts");
+
+        assert_eq!(draft.change, Amount::ZERO, "max leaves no change");
+        assert_eq!(
+            draft.amount + draft.fee,
+            Amount::from_sat(300_000),
+            "everything is accounted for"
+        );
+
+        let mut psbt = draft.psbt;
+        w.sign(&mut psbt, &mnemonic).expect("signs");
+        let tx = psbt.extract_tx().expect("final");
+        h.node
+            .client
+            .send_raw_transaction(&tx)
+            .expect("the node accepts it");
+        w.record_broadcast(tx).expect("records");
+    }
+
+    h.node
+        .client
+        .generate_to_address(1, &miner)
+        .expect("confirms");
+    wallet_core::onchain::sync::sync_now(&h.cfg, alice)
+        .await
+        .expect("syncs");
+
+    let a = wallet_core::onchain::OpenWallet::load(&h.cfg.wallet_db(&alice), Network::Regtest)
+        .expect("loads");
+    assert_eq!(
+        a.balance(true).total,
+        Amount::ZERO,
+        "a drained wallet really is empty"
+    );
+}
+
+/// Spending more than there is must be a typed error, not a panic and not a
+/// transaction the node rejects later (§8.1).
+#[tokio::test(flavor = "multi_thread")]
+async fn spending_more_than_the_balance_is_refused_with_both_numbers() {
+    let h = harness();
+    let alice = UserId::new();
+    let bob = UserId::new();
+
+    funded(&h, alice, MNEMONIC, 50_000).await;
+
+    let bob_address = {
+        let mut w = make_wallet(&h.cfg, bob, OTHER_MNEMONIC);
+        w.next_address().expect("reveals").address
+    };
+
+    let mut w = wallet_core::onchain::OpenWallet::load(&h.cfg.wallet_db(&alice), Network::Regtest)
+        .expect("loads");
+
+    match w.draft(
+        &bob_address,
+        SendAmount::Exact(Amount::from_sat(10_000_000)),
+        wallet_core::bitcoin::FeeRate::from_sat_per_vb(2).expect("valid"),
+    ) {
+        Err(wallet_core::CoreError::InsufficientFunds { available, .. }) => {
+            assert!(available <= Amount::from_sat(50_000));
+        }
+        Err(other) => panic!("expected InsufficientFunds, got {other:?}"),
+        Ok(_) => panic!("a payment larger than the balance must not draft"),
+    }
+}
+
+/// A wallet signs only with its own seed: the wrong mnemonic cannot finalise.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_foreign_seed_cannot_sign_this_wallets_transaction() {
+    let h = harness();
+    let alice = UserId::new();
+    let bob = UserId::new();
+
+    funded(&h, alice, MNEMONIC, 200_000).await;
+
+    let bob_address = {
+        let mut w = make_wallet(&h.cfg, bob, OTHER_MNEMONIC);
+        w.next_address().expect("reveals").address
+    };
+
+    let mut w = wallet_core::onchain::OpenWallet::load(&h.cfg.wallet_db(&alice), Network::Regtest)
+        .expect("loads");
+    let draft = w
+        .draft(
+            &bob_address,
+            SendAmount::Exact(Amount::from_sat(50_000)),
+            wallet_core::bitcoin::FeeRate::from_sat_per_vb(2).expect("valid"),
+        )
+        .expect("drafts");
+
+    let wrong = wallet_core::keys::parse(OTHER_MNEMONIC).expect("parses");
+    let mut psbt = draft.psbt;
+    assert!(
+        w.sign(&mut psbt, &wrong).is_err(),
+        "another seed must not finalise this wallet's inputs"
+    );
+}

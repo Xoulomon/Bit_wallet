@@ -8,6 +8,7 @@
 //! satisfying the `RpcApi` trait `bdk_bitcoind_rpc` requires (§2).
 
 pub mod bitrpc;
+pub mod fees;
 pub mod polar;
 
 use crate::{

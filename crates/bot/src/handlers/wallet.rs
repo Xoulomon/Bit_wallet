@@ -426,12 +426,29 @@ pub async fn receive_pin(
         },
 
         PendingAction::Send { quote } => {
-            // Step 5 signs and broadcasts here; the PIN plumbing is already in
-            // place, which is the point of collecting it in one handler.
-            let _ = (quote, Auth::Pin(pin));
-            dialogue.exit().await?;
-            bot.send_message(msg.chat.id, "Sending is implemented in Step 5.")
-                .await?;
+            // The PIN opens a session inside `confirm_send`, so the same call
+            // both authorises and signs — the bot never learns whether a seed
+            // was decrypted (§3a rule 5).
+            match quote.parse() {
+                Ok(quote) => {
+                    return crate::handlers::send::broadcast(
+                        &bot,
+                        msg.chat.id,
+                        &dialogue,
+                        &ctx,
+                        user,
+                        quote,
+                        Auth::Pin(pin),
+                    )
+                    .await;
+                }
+                Err(_) => {
+                    dialogue.exit().await?;
+                    bot.send_message(msg.chat.id, ui::quote_expired_card(ctx.core.network()))
+                        .parse_mode(ParseMode::Html)
+                        .await?;
+                }
+            }
         }
     }
     Ok(())

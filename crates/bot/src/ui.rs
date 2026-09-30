@@ -884,3 +884,376 @@ mod onchain_tests {
         assert!(confirmed(&txid(3).to_string(), 6).contains("6 confs"));
     }
 }
+
+// ----------------------------------------------------------------- the send flow
+// §8.3, screen by screen. Two cards and one rule: money never moves without a
+// confirm card, and the card carries every number the user is agreeing to.
+
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
+use wallet_core::bitcoin::FeeRate;
+use wallet_core::types::{Broadcast, FeeLabel, FeeOptions, FeeSource, SendQuote};
+
+/// The fee screen (§8.3). The same code on both networks: it draws the presets
+/// it is handed and nothing more.
+pub fn fee_card(network: Network, amount: Option<Amount>, to: &str, fees: &FeeOptions) -> String {
+    let what = match amount {
+        Some(a) => format!(
+            "Sending {} to <code>{}</code>",
+            sats(a),
+            escape(&shorten(to))
+        ),
+        None => format!("Sending to <code>{}</code>", escape(&shorten(to))),
+    };
+
+    let provenance = match &fees.source {
+        FeeSource::Node => "Rates from your node".to_string(),
+        FeeSource::External { name } => format!("Rates from {}", escape(name)),
+        FeeSource::Unavailable => {
+            // §6: it never silently guesses. Say why the buttons are missing.
+            "No fee estimate available right now — enter a rate yourself".to_string()
+        }
+    };
+
+    format!(
+        "{} · <b>Choose a fee</b>\n{what}\n{provenance} · floor {} sat/vB",
+        badge(network),
+        fees.floor.to_sat_per_vb_ceil()
+    )
+}
+
+pub fn fee_keyboard(fees: &FeeOptions) -> InlineKeyboardMarkup {
+    let mut presets: Vec<InlineKeyboardButton> = fees
+        .presets
+        .iter()
+        .map(|(label, rate)| {
+            InlineKeyboardButton::callback(
+                format!("{} {}", fee_label(*label), rate.to_sat_per_vb_ceil()),
+                format!("send:fee:{}", fee_slug(*label)),
+            )
+        })
+        .collect();
+
+    // Keep a row from growing past what a phone shows.
+    presets.truncate(3);
+
+    let mut rows = Vec::new();
+    if !presets.is_empty() {
+        rows.push(presets);
+    }
+
+    let mut last = Vec::new();
+    if fees.allows_custom {
+        last.push(InlineKeyboardButton::callback(
+            "Custom sat/vB",
+            "send:fee:custom",
+        ));
+    }
+    last.push(InlineKeyboardButton::callback("✖ Cancel", "send:cancel:-"));
+    rows.push(last);
+
+    InlineKeyboardMarkup::new(rows)
+}
+
+fn fee_label(l: FeeLabel) -> &'static str {
+    match l {
+        FeeLabel::Fast => "Fast",
+        FeeLabel::Normal => "Normal",
+        FeeLabel::Slow => "Slow",
+    }
+}
+
+pub fn fee_slug(l: FeeLabel) -> &'static str {
+    match l {
+        FeeLabel::Fast => "fast",
+        FeeLabel::Normal => "normal",
+        FeeLabel::Slow => "slow",
+    }
+}
+
+pub fn fee_from_slug(slug: &str) -> Option<FeeLabel> {
+    match slug {
+        "fast" => Some(FeeLabel::Fast),
+        "normal" => Some(FeeLabel::Normal),
+        "slow" => Some(FeeLabel::Slow),
+        _ => None,
+    }
+}
+
+pub fn ask_custom_fee(floor: FeeRate) -> String {
+    format!(
+        "Send a fee rate in sat/vB — a whole number, at least {}.",
+        floor.to_sat_per_vb_ceil()
+    )
+}
+
+/// The confirm card (§8.3). Every number the user is agreeing to, and the
+/// countdown that says the quote will not wait forever.
+pub fn confirm_card(network: Network, q: &SendQuote) -> String {
+    let header = if q.replaces.is_some() {
+        "Fee bump"
+    } else {
+        "Confirm payment"
+    };
+
+    let mut out = format!(
+        "{} · <b>{header}</b>\n\n\
+         <code>To      {}</code>\n\
+         <code>Amount  {}</code>\n\
+         <code>Fee     {} @ {} sat/vB</code>\n\
+         <code>Total   {}</code>",
+        badge(network),
+        escape(&shorten(&q.recipient.to_string())),
+        sats_and_btc(q.amount),
+        sats(q.fee),
+        q.fee_rate.to_sat_per_vb_ceil(),
+        sats(q.total)
+    );
+
+    if q.change > Amount::ZERO {
+        out.push_str(&format!("\n<code>Change  {}</code>", sats(q.change)));
+    }
+    if q.is_payjoin {
+        out.push_str("\n\n🤝 Payjoin will be attempted — it makes this payment harder to trace.");
+    }
+    if let Some(replaced) = q.replaces {
+        out.push_str(&format!(
+            "\n\nReplaces <code>{}</code>",
+            escape(&shorten(&replaced.to_string()))
+        ));
+    }
+
+    out.push_str(&format!("\n\n⏳ Expires in {}", countdown(q)));
+    out
+}
+
+fn countdown(q: &SendQuote) -> String {
+    match q.expires_at.duration_since(std::time::SystemTime::now()) {
+        Ok(left) => format!("{}:{:02}", left.as_secs() / 60, left.as_secs() % 60),
+        Err(_) => "0:00".into(),
+    }
+}
+
+pub fn confirm_keyboard(q: &SendQuote) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new([[
+        InlineKeyboardButton::callback("✅ Confirm & sign", format!("send:confirm:{}", q.id)),
+        InlineKeyboardButton::callback("✖ Cancel", format!("send:cancel:{}", q.id)),
+    ]])
+}
+
+pub fn quote_expired_card(network: Network) -> String {
+    format!(
+        "{} · <b>Expired</b>\n\nThat card quoted a fee that may now be stale, so it was not \
+         signed. Nothing was sent. Start /send again.",
+        badge(network)
+    )
+}
+
+pub fn broadcasting() -> String {
+    "📡 Signing and broadcasting…".into()
+}
+
+pub fn broadcast_done(network: Network, b: &Broadcast) -> String {
+    format!(
+        "{} · 📡 <b>Sent</b>\n\n<code>{}</code>\n{} + {} fee\n\nTracking confirmations.",
+        badge(network),
+        escape(&shorten(&b.txid.to_string())),
+        sats(b.amount),
+        sats(b.fee)
+    )
+}
+
+pub fn send_usage(network: Network) -> String {
+    format!(
+        "{}\n\n<b>Send bitcoin</b>\n\n\
+         <code>/send &lt;address&gt; &lt;sats&gt;</code>\n\
+         <code>/send &lt;address&gt; max</code>\n\
+         <code>/send &lt;bitcoin: URI&gt;</code>\n\n\
+         A BIP21 URI can carry its own amount, and a payjoin endpoint if the \
+         receiver offers one.",
+        badge(network)
+    )
+}
+
+pub fn send_cancelled() -> String {
+    "Cancelled. Nothing was sent.".into()
+}
+
+pub fn mined(network: Network, blocks: usize) -> String {
+    format!("{} · ⛏ Mined {blocks} block(s).", badge(network))
+}
+
+#[cfg(test)]
+mod send_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+    use wallet_core::bitcoin::Txid;
+    use wallet_core::types::QuoteId;
+
+    fn vb(n: u64) -> FeeRate {
+        FeeRate::from_sat_per_vb(n).expect("a valid rate")
+    }
+
+    fn address() -> wallet_core::bitcoin::Address {
+        "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"
+            .parse::<wallet_core::bitcoin::Address<_>>()
+            .expect("parses")
+            .require_network(Network::Bitcoin)
+            .expect("mainnet")
+    }
+
+    fn quote() -> SendQuote {
+        SendQuote {
+            id: QuoteId::new(),
+            recipient: address(),
+            amount: Amount::from_sat(50_000),
+            fee: Amount::from_sat(1_410),
+            fee_rate: vb(6),
+            total: Amount::from_sat(51_410),
+            change: Amount::from_sat(212_590),
+            is_payjoin: false,
+            replaces: None,
+            expires_at: SystemTime::now() + Duration::from_secs(300),
+        }
+    }
+
+    fn options(presets: Vec<(FeeLabel, FeeRate)>, source: FeeSource) -> FeeOptions {
+        FeeOptions {
+            presets,
+            floor: vb(1),
+            source,
+            allows_custom: true,
+        }
+    }
+
+    /// §8.3: the card carries every number the user is agreeing to.
+    #[test]
+    fn the_confirm_card_shows_amount_fee_total_and_change() {
+        let card = confirm_card(Network::Bitcoin, &quote());
+        assert!(card.contains("50,000 sats"));
+        assert!(card.contains("1,410 sats"));
+        assert!(card.contains("51,410 sats"));
+        assert!(card.contains("212,590 sats"));
+        assert!(card.contains("6 sat/vB"));
+        assert!(card.contains("Expires in"));
+        assert!(card.starts_with("🟠 MAINNET"));
+    }
+
+    #[test]
+    fn a_payjoin_quote_says_so_on_the_card() {
+        let mut q = quote();
+        q.is_payjoin = true;
+        assert!(confirm_card(Network::Regtest, &q).contains("Payjoin"));
+        assert!(!confirm_card(Network::Regtest, &quote()).contains("Payjoin"));
+    }
+
+    /// §8.3: /bumpfee reuses the card; only the header and one line differ.
+    #[test]
+    fn a_fee_bump_is_the_same_card_with_a_different_header() {
+        let mut q = quote();
+        q.replaces = Some(Txid::from_raw_hash(
+            wallet_core::bitcoin::hashes::Hash::from_byte_array([4u8; 32]),
+        ));
+        let card = confirm_card(Network::Bitcoin, &q);
+        assert!(card.contains("Fee bump"));
+        assert!(card.contains("Replaces"));
+        assert!(!confirm_card(Network::Bitcoin, &quote()).contains("Fee bump"));
+    }
+
+    #[test]
+    fn a_drained_wallet_shows_no_change_line() {
+        let mut q = quote();
+        q.change = Amount::ZERO;
+        assert!(!confirm_card(Network::Regtest, &q).contains("Change"));
+    }
+
+    /// §6: the keyboard draws whatever presets it is handed — the same code on
+    /// both networks.
+    #[test]
+    fn the_fee_keyboard_draws_the_presets_it_is_handed() {
+        let three = fee_keyboard(&options(
+            vec![
+                (FeeLabel::Fast, vb(12)),
+                (FeeLabel::Normal, vb(6)),
+                (FeeLabel::Slow, vb(2)),
+            ],
+            FeeSource::External {
+                name: "mempool.space".into(),
+            },
+        ));
+        assert_eq!(three.inline_keyboard[0].len(), 3);
+
+        // No estimate: no preset row at all, just Custom and Cancel.
+        let none = fee_keyboard(&options(vec![], FeeSource::Unavailable));
+        assert_eq!(none.inline_keyboard.len(), 1);
+        assert_eq!(none.inline_keyboard[0].len(), 2);
+    }
+
+    /// §6: when there is no estimate, say why rather than showing a bare prompt.
+    #[test]
+    fn an_unavailable_estimator_is_explained_on_the_fee_card() {
+        let card = fee_card(
+            Network::Bitcoin,
+            Some(Amount::from_sat(50_000)),
+            "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",
+            &options(vec![], FeeSource::Unavailable),
+        );
+        assert!(card.contains("No fee estimate available"));
+        assert!(card.contains("floor 1 sat/vB"));
+    }
+
+    #[test]
+    fn the_fee_card_names_its_source() {
+        let card = fee_card(
+            Network::Bitcoin,
+            None,
+            "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",
+            &options(
+                vec![(FeeLabel::Normal, vb(6))],
+                FeeSource::External {
+                    name: "mempool.space".into(),
+                },
+            ),
+        );
+        assert!(card.contains("mempool.space"));
+    }
+
+    /// §8.5: callback data carries an opaque id, never an amount or a rate.
+    #[test]
+    fn callback_data_holds_no_money() {
+        let q = quote();
+        let keyboard = confirm_keyboard(&q);
+        let data: Vec<String> = keyboard
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .filter_map(|b| match &b.kind {
+                teloxide::types::InlineKeyboardButtonKind::CallbackData(d) => Some(d.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(data.iter().any(|d| d == &format!("send:confirm:{}", q.id)));
+        for d in &data {
+            assert!(d.len() <= 64, "Telegram's callback data limit is 64 bytes");
+            assert!(!d.contains("50000"), "an amount must not be replayable");
+            assert!(!d.contains("bc1q"), "an address must not be replayable");
+        }
+    }
+
+    #[test]
+    fn fee_slugs_round_trip() {
+        for label in [FeeLabel::Fast, FeeLabel::Normal, FeeLabel::Slow] {
+            assert_eq!(fee_from_slug(fee_slug(label)), Some(label));
+        }
+        assert_eq!(fee_from_slug("nonsense"), None);
+    }
+
+    /// §8.1: an expired card must say that nothing was sent, not merely that
+    /// something failed.
+    #[test]
+    fn the_expiry_card_says_nothing_was_sent() {
+        let card = quote_expired_card(Network::Bitcoin);
+        assert!(card.contains("Nothing was sent"));
+        assert!(card.contains("/send"));
+    }
+}
