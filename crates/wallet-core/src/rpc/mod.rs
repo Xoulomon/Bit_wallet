@@ -93,6 +93,20 @@ impl ChainSource {
         Arc::clone(&self.client)
     }
 
+    /// A second client for the block emitter, drawing from the capped sync
+    /// allowance rather than the interactive one (§4). On regtest there is no
+    /// budget to divide, so both lanes are the same client.
+    pub fn sync_client(&self, cfg: &AppConfig) -> Result<Arc<Client>> {
+        match (&cfg.backend, &self.budget) {
+            (BackendConfig::Bitrpc(b), Some(budget)) => Ok(Arc::new(bitrpc::client_for(
+                b,
+                Arc::clone(budget),
+                bitrpc::Lane::Sync,
+            )?)),
+            _ => Ok(Arc::clone(&self.client)),
+        }
+    }
+
     pub fn network(&self) -> Network {
         self.network
     }
