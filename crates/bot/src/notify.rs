@@ -61,10 +61,12 @@ async fn deliver(bot: &Bot, ctx: &Ctx, event: CoreEvent) {
 
         CoreEvent::SessionExpired { .. } => crate::ui::session_expired(),
 
-        CoreEvent::Payjoin { .. } => {
-            // Step 6 renders these.
-            return;
-        }
+        CoreEvent::Payjoin { state, .. } => match crate::ui::payjoin_event(state) {
+            Some(line) => line,
+            // Waiting and ProposalSent are visible in /pj_sessions; a message
+            // for every transition would be noise (§7's "no scary errors").
+            None => return,
+        },
 
         CoreEvent::BackendHealth(health) => {
             // This concerns everyone, so it goes to the people who can act on

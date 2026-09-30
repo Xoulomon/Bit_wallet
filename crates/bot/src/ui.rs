@@ -1111,6 +1111,7 @@ mod send_tests {
             total: Amount::from_sat(51_410),
             change: Amount::from_sat(212_590),
             is_payjoin: false,
+            payjoin_uri: None,
             replaces: None,
             expires_at: SystemTime::now() + Duration::from_secs(300),
         }
@@ -1255,5 +1256,242 @@ mod send_tests {
         let card = quote_expired_card(Network::Bitcoin);
         assert!(card.contains("Nothing was sent"));
         assert!(card.contains("/send"));
+    }
+}
+
+// ------------------------------------------------------------------- payjoin
+// §7's UX note: explain the privacy benefit, badge the outcome, and never make
+// a fallback look like a failure — the payment went through either way.
+
+use wallet_core::types::{PayjoinReceipt, PayjoinRole, PayjoinSessionView, PayjoinState};
+
+pub fn payjoin_receipt(network: Network, amount: Amount, r: &PayjoinReceipt) -> String {
+    let mut out = format!(
+        "{} · 🤝 <b>Payjoin request for {}</b>\n\n<code>{}</code>\n\n\
+         Pay this with a wallet that supports payjoin and your two wallets build the \
+         transaction together — so the usual assumption that every input belongs to the \
+         sender stops holding for this payment.\n\n\
+         If the sender's wallet doesn't do payjoin, they can still pay it normally.",
+        badge(network),
+        sats(amount),
+        escape(&r.bip21)
+    );
+
+    if network == Network::Bitcoin {
+        // §7's privacy note, stated rather than implied.
+        out.push_str(
+            "\n\nℹ️ This hides the payment from outside observers, not from the node \
+             provider this bot talks to.",
+        );
+    }
+
+    out.push_str("\n\nThis request expires in an hour. /pj_sessions shows how it's going.");
+    out
+}
+
+pub fn payjoin_sessions(network: Network, sessions: &[PayjoinSessionView]) -> String {
+    if sessions.is_empty() {
+        return format!(
+            "{}\n\nNo payjoin sessions. /pj_receive &lt;sats&gt; starts one.",
+            badge(network)
+        );
+    }
+
+    let mut out = format!("{}\n\n<b>Payjoin sessions</b>", badge(network));
+    for s in sessions {
+        out.push_str(&format!(
+            "\n\n{} {} — {}\n<code>{}</code>",
+            payjoin_badge(&s.state),
+            match s.role {
+                PayjoinRole::Receiver => "Receiving",
+                PayjoinRole::Sender => "Sending",
+            },
+            payjoin_state_text(&s.state),
+            escape(&shorten(&s.id.to_string()))
+        ));
+    }
+    out
+}
+
+pub fn payjoin_badge(state: &PayjoinState) -> &'static str {
+    match state {
+        PayjoinState::Completed { .. } => "✅",
+        PayjoinState::FellBack { .. } => "↩️",
+        PayjoinState::Failed { .. } => "⚠️",
+        PayjoinState::Expired | PayjoinState::Cancelled => "—",
+        _ => "⏳",
+    }
+}
+
+/// §7: no scary errors. A fallback is an outcome, not a failure.
+pub fn payjoin_state_text(state: &PayjoinState) -> String {
+    match state {
+        PayjoinState::Waiting => "waiting for the other side".into(),
+        PayjoinState::ProposalReceived => "checking their proposal".into(),
+        PayjoinState::ProposalSent => "proposal sent, waiting".into(),
+        PayjoinState::Completed { .. } => "done — payjoin".into(),
+        PayjoinState::FellBack { .. } => "sent as a regular transaction".into(),
+        PayjoinState::Expired => "expired".into(),
+        PayjoinState::Cancelled => "cancelled".into(),
+        PayjoinState::Failed { .. } => "didn't complete — funds untouched".into(),
+    }
+}
+
+/// §8.6: the push notification for a payjoin state change.
+pub fn payjoin_event(state: &PayjoinState) -> Option<String> {
+    Some(match state {
+        PayjoinState::ProposalReceived => "🤝 Payjoin proposal received — verifying".into(),
+        PayjoinState::Completed { txid } => {
+            format!("🤝 Payjoin ✅ — {}", shorten(&txid.to_string()))
+        }
+        PayjoinState::FellBack { txid } => format!(
+            "↩️ Sent as a regular transaction (payjoin didn't complete) — {}",
+            shorten(&txid.to_string())
+        ),
+        PayjoinState::Expired => "Payjoin request expired. Nothing was sent.".into(),
+        PayjoinState::Failed { .. } => {
+            "The payjoin didn't complete. Your funds are untouched — /pj_sessions has the detail."
+                .into()
+        }
+        // Waiting, ProposalSent and Cancelled are visible in /pj_sessions; a
+        // notification for each would be noise.
+        _ => return None,
+    })
+}
+
+pub fn payjoin_usage(network: Network) -> String {
+    format!(
+        "{}\n\n<code>/pj_receive &lt;sats&gt;</code> — ask to be paid with payjoin.",
+        badge(network)
+    )
+}
+
+pub fn payjoin_cancelled() -> String {
+    "Payjoin session cancelled.".into()
+}
+
+#[cfg(test)]
+mod payjoin_tests {
+    use super::*;
+    use wallet_core::bitcoin::Txid;
+    use wallet_core::types::SessionId;
+
+    fn txid(b: u8) -> Txid {
+        Txid::from_raw_hash(wallet_core::bitcoin::hashes::Hash::from_byte_array([b; 32]))
+    }
+
+    fn session(state: PayjoinState, role: PayjoinRole) -> PayjoinSessionView {
+        PayjoinSessionView {
+            id: SessionId::new(),
+            role,
+            state,
+            amount: None,
+            created_at: std::time::SystemTime::now(),
+            expires_at: std::time::SystemTime::now(),
+        }
+    }
+
+    /// §7: explain the privacy benefit rather than assuming the user knows it.
+    #[test]
+    fn a_receive_request_explains_what_payjoin_buys() {
+        let receipt = PayjoinReceipt {
+            session_id: SessionId::new(),
+            bip21: "bitcoin:bc1qexample?amount=0.0005&pj=https://payjo.in/X".into(),
+            expires_at: std::time::SystemTime::now(),
+        };
+        let card = payjoin_receipt(Network::Regtest, Amount::from_sat(50_000), &receipt);
+
+        assert!(card.contains("together"));
+        assert!(
+            card.contains("pay it normally"),
+            "a non-payjoin sender is not stuck"
+        );
+        assert!(card.contains("payjo.in"));
+    }
+
+    /// §7's privacy note: payjoin hides the payment from observers, not from
+    /// the backend this bot talks to.
+    #[test]
+    fn mainnet_says_who_can_still_see_the_payment() {
+        let receipt = PayjoinReceipt {
+            session_id: SessionId::new(),
+            bip21: "bitcoin:bc1qexample?pj=https://payjo.in/X".into(),
+            expires_at: std::time::SystemTime::now(),
+        };
+        let card = payjoin_receipt(Network::Bitcoin, Amount::from_sat(50_000), &receipt);
+        assert!(card.contains("not from the node provider"));
+
+        let regtest = payjoin_receipt(Network::Regtest, Amount::from_sat(50_000), &receipt);
+        assert!(!regtest.contains("node provider"));
+    }
+
+    /// §7: no scary errors. A fallback is an outcome, not a failure.
+    #[test]
+    fn a_fallback_reads_as_a_completed_payment() {
+        let line = payjoin_event(&PayjoinState::FellBack { txid: txid(1) })
+            .expect("a fallback is worth announcing");
+        assert!(line.contains("Sent as a regular transaction"));
+        assert!(!line.to_lowercase().contains("fail"));
+        assert!(!line.contains('⚠'));
+    }
+
+    #[test]
+    fn a_failure_says_the_funds_are_untouched() {
+        let line = payjoin_event(&PayjoinState::Failed {
+            reason: "check failed".into(),
+        })
+        .expect("worth announcing");
+        assert!(line.contains("untouched"));
+    }
+
+    #[test]
+    fn quiet_transitions_produce_no_notification() {
+        // A message for every transition would be noise.
+        assert!(payjoin_event(&PayjoinState::Waiting).is_none());
+        assert!(payjoin_event(&PayjoinState::ProposalSent).is_none());
+        assert!(payjoin_event(&PayjoinState::Cancelled).is_none());
+    }
+
+    #[test]
+    fn an_empty_session_list_offers_the_next_step() {
+        assert!(payjoin_sessions(Network::Regtest, &[]).contains("/pj_receive"));
+    }
+
+    #[test]
+    fn sessions_are_badged_by_outcome() {
+        let list = [
+            session(PayjoinState::Waiting, PayjoinRole::Receiver),
+            session(
+                PayjoinState::Completed { txid: txid(2) },
+                PayjoinRole::Sender,
+            ),
+            session(
+                PayjoinState::FellBack { txid: txid(3) },
+                PayjoinRole::Sender,
+            ),
+        ];
+        let rendered = payjoin_sessions(Network::Regtest, &list);
+
+        assert!(rendered.contains("Receiving"));
+        assert!(rendered.contains("Sending"));
+        assert!(rendered.contains("done — payjoin"));
+        assert!(rendered.contains("sent as a regular transaction"));
+    }
+
+    #[test]
+    fn every_state_has_a_badge_and_a_sentence() {
+        for state in [
+            PayjoinState::Waiting,
+            PayjoinState::ProposalReceived,
+            PayjoinState::ProposalSent,
+            PayjoinState::Completed { txid: txid(4) },
+            PayjoinState::FellBack { txid: txid(5) },
+            PayjoinState::Expired,
+            PayjoinState::Cancelled,
+            PayjoinState::Failed { reason: "x".into() },
+        ] {
+            assert!(!payjoin_badge(&state).is_empty());
+            assert!(!payjoin_state_text(&state).is_empty());
+        }
     }
 }

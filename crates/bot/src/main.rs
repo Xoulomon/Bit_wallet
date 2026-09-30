@@ -107,6 +107,8 @@ fn schema() -> teloxide::dispatching::UpdateHandler<anyhow::Error> {
         .branch(case![Command::Send { args }].endpoint(handlers::send::send))
         .branch(case![Command::Bumpfee { txid }].endpoint(handlers::send::bump_fee))
         .branch(case![Command::Mine { blocks }].endpoint(handlers::admin::mine))
+        .branch(case![Command::PjReceive { sats }].endpoint(handlers::payjoin::receive))
+        .branch(case![Command::PjSessions].endpoint(handlers::payjoin::sessions))
         .endpoint(handlers::start::not_yet);
 
     // §8.4: every state that expects text has exactly one endpoint, so
@@ -154,7 +156,8 @@ fn schema() -> teloxide::dispatching::UpdateHandler<anyhow::Error> {
             case![State::AwaitFeeChoice { target, amount }].endpoint(handlers::send::choose_fee),
         ))
         .branch(dptree::filter(starts_with("send:confirm:")).endpoint(handlers::send::confirm))
-        .branch(dptree::filter(starts_with("send:cancel:")).endpoint(handlers::send::cancel));
+        .branch(dptree::filter(starts_with("send:cancel:")).endpoint(handlers::send::cancel))
+        .branch(dptree::filter(starts_with("pj:cancel:")).endpoint(handlers::payjoin::cancel));
 
     dptree::entry().branch(messages).branch(callbacks)
 }

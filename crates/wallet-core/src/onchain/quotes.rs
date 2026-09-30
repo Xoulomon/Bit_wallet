@@ -143,6 +143,7 @@ mod tests {
             total: Amount::from_sat(51_410),
             change: Amount::from_sat(212_590),
             is_payjoin: false,
+            payjoin_uri: None,
             replaces: None,
             expires_at: SystemTime::now() + QUOTE_TTL,
         }

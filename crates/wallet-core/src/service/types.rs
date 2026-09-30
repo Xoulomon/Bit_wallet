@@ -297,6 +297,9 @@ pub struct FeeOptions {
 #[derive(Debug, Clone)]
 pub struct SendRequest {
     pub target: PaymentTarget,
+    /// The URI exactly as the user supplied it, so the payjoin sender can hand
+    /// it back to the protocol unchanged (§7).
+    pub raw: String,
     pub amount: SendAmount,
     pub fee_rate: FeeRate,
 }
@@ -321,6 +324,9 @@ pub struct SendQuote {
     pub total: Amount,
     pub change: Amount,
     pub is_payjoin: bool,
+    /// The BIP21 URI the payjoin sender needs. Kept inside core with the PSBT;
+    /// the front end never has to hold it.
+    pub payjoin_uri: Option<String>,
     /// Set for `/bumpfee`, so the front end can title the same card differently.
     pub replaces: Option<Txid>,
     pub expires_at: SystemTime,

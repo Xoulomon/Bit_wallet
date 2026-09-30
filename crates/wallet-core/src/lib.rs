@@ -20,6 +20,7 @@ pub mod crypto;
 pub mod error;
 pub mod keys;
 pub mod onchain;
+pub mod payjoin;
 pub mod rpc;
 pub mod service;
 pub mod session;

@@ -201,6 +201,7 @@ async fn quote_and_show(
 
     let request = SendRequest {
         target: parsed,
+        raw: target.to_string(),
         amount: match amount {
             Some(sats) => SendAmount::Exact(Amount::from_sat(sats)),
             None => SendAmount::Max,

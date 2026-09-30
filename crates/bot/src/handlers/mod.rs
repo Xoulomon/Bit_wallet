@@ -5,6 +5,7 @@
 
 pub mod admin;
 pub mod onchain;
+pub mod payjoin;
 pub mod send;
 pub mod start;
 pub mod wallet;

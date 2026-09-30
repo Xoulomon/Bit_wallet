@@ -42,6 +42,7 @@ pub struct WalletService {
     fees: Arc<crate::rpc::fees::FeePolicy>,
     /// Drafted payments awaiting a human (§3a rule 4).
     quotes: crate::onchain::quotes::Quotes,
+    payjoin: Arc<crate::payjoin::persist::SessionStore>,
 }
 
 /// A fee bump keeps the original recipient; find it among the outputs that are
@@ -87,6 +88,7 @@ impl WalletService {
         let sessions = Sessions::new(cfg.session_idle_timeout, events.clone());
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let cfg_for_fees = cfg.clone();
+        let payjoin_db = cfg.network_dir().join("payjoin.sqlite");
 
         // One follower for every wallet: a block is fetched once, however many
         // users there are (§6).
@@ -106,6 +108,7 @@ impl WalletService {
             sessions,
             shutdown: shutdown_tx,
             quotes: crate::onchain::quotes::Quotes::new(),
+            payjoin: Arc::new(crate::payjoin::persist::SessionStore::open(&payjoin_db)?),
         }))
     }
 
@@ -522,6 +525,11 @@ impl WalletService {
             total: draft.amount + draft.fee,
             change: draft.change,
             is_payjoin: req.target.payjoin_endpoint.is_some(),
+            payjoin_uri: req
+                .target
+                .payjoin_endpoint
+                .as_ref()
+                .map(|_| req.raw.clone()),
             replaces: None,
             expires_at: std::time::SystemTime::now() + crate::onchain::quotes::QUOTE_TTL,
         };
@@ -547,6 +555,37 @@ impl WalletService {
         self.sessions
             .with_mnemonic(u, |m| wallet.sign(&mut psbt, m))
             .ok_or(CoreError::Locked)??;
+
+        // §7: a `pj=` target goes to the payjoin sender, whose fallback is this
+        // very transaction. A payjoin that fails is never a payment that fails.
+        if quote.is_payjoin
+            && let Some(uri) = quote.payjoin_uri.clone()
+        {
+            let mnemonic = self
+                .sessions
+                .with_mnemonic(u, |m| m.clone())
+                .ok_or(CoreError::Locked)?;
+
+            let outcome = crate::payjoin::send::attempt(crate::payjoin::send::Attempt {
+                cfg: self.cfg.clone(),
+                store: Arc::clone(&self.payjoin),
+                events: self.events.clone(),
+                user: u,
+                original: psbt,
+                uri,
+                fee_rate: quote.fee_rate,
+                mnemonic,
+            })
+            .await?;
+
+            tracing::info!(user = %u, txid = %outcome.txid, payjoin = outcome.payjoin, "broadcast");
+            return Ok(Broadcast {
+                txid: outcome.txid,
+                amount: quote.amount,
+                fee: quote.fee,
+                payjoin: outcome.payjoin,
+            });
+        }
 
         let tx = psbt
             .extract_tx()
@@ -596,6 +635,7 @@ impl WalletService {
             total: draft.amount + draft.fee,
             change: draft.change,
             is_payjoin: false,
+            payjoin_uri: None,
             replaces: Some(txid),
             expires_at: std::time::SystemTime::now() + crate::onchain::quotes::QUOTE_TTL,
         };
@@ -653,16 +693,80 @@ impl WalletService {
 
     /// `/pj_receive` (§7). Returns the BIP21 string; rendering it as a QR is the
     /// front end's job — core never returns an image (§3a rule 2).
-    pub async fn payjoin_receive(&self, _u: UserId, _amount: Amount) -> Result<PayjoinReceipt> {
-        todo!("Step 6: payjoin")
+    ///
+    /// Needs an open session: the receiver has to contribute an input and sign
+    /// the proposal, and both want the seed.
+    pub async fn payjoin_receive(&self, u: UserId, amount: Amount) -> Result<PayjoinReceipt> {
+        let mnemonic = self
+            .sessions
+            .with_mnemonic(u, |m| m.clone())
+            .ok_or(CoreError::Locked)?;
+
+        let address = self.open_wallet(u)?.next_address()?.address;
+
+        let started = crate::payjoin::receive::start(
+            &self.cfg,
+            Arc::clone(&self.payjoin),
+            u,
+            amount,
+            address,
+        )
+        .await?;
+
+        // The polling task lives in core, so any front end — or none — sees the
+        // session through to its end (§7 step 3).
+        tokio::spawn(crate::payjoin::receive::run(
+            crate::payjoin::receive::Context {
+                cfg: self.cfg.clone(),
+                store: Arc::clone(&self.payjoin),
+                events: self.events.clone(),
+                user: u,
+                session: started.session,
+                mnemonic,
+            },
+        ));
+
+        Ok(PayjoinReceipt {
+            session_id: started.session,
+            bip21: started.bip21,
+            expires_at: started.expires_at,
+        })
     }
 
-    pub async fn payjoin_sessions(&self, _u: UserId) -> Result<Vec<PayjoinSessionView>> {
-        todo!("Step 6: payjoin")
+    pub async fn payjoin_sessions(&self, u: UserId) -> Result<Vec<PayjoinSessionView>> {
+        let rows = self.payjoin.for_user(u)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| PayjoinSessionView {
+                id: row.id,
+                role: row.role,
+                state: if row.closed && row.state == "Waiting" {
+                    PayjoinState::Cancelled
+                } else {
+                    crate::payjoin::receive::state_from_label(&row.state)
+                },
+                amount: None,
+                created_at: row.created_at,
+                expires_at: row.expires_at,
+            })
+            .collect())
     }
 
-    pub async fn payjoin_cancel(&self, _u: UserId, _id: SessionId) -> Result<()> {
-        todo!("Step 6: payjoin")
+    pub async fn payjoin_cancel(&self, u: UserId, id: SessionId) -> Result<()> {
+        let row = self.payjoin.row(id)?.ok_or(CoreError::NoSuchSession)?;
+        // Another user's session id reads exactly like one that does not exist.
+        if row.user != u {
+            return Err(CoreError::NoSuchSession);
+        }
+
+        self.payjoin.set_state(id, "Cancelled")?;
+        self.payjoin.close(id)?;
+        self.emit(CoreEvent::Payjoin {
+            user: u,
+            session: id,
+            state: PayjoinState::Cancelled,
+        });
+        Ok(())
     }
 
     // ------------------------------------------------------------- regtest only
