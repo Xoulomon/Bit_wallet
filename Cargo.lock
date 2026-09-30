@@ -403,12 +403,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dotenvy",
+ "futures",
  "rusqlite",
+ "serde",
+ "serde_json",
  "teloxide",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "wallet-core",
+ "zeroize",
 ]
 
 [[package]]

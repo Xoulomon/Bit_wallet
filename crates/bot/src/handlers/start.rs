@@ -5,9 +5,16 @@ use anyhow::Result;
 use teloxide::{prelude::*, types::ParseMode, utils::command::BotCommands};
 
 pub async fn start(bot: Bot, msg: Message, ctx: Ctx) -> Result<()> {
-    // Step 1: no wallet can exist yet, because no create path does. Step 3
-    // replaces this with `ctx.core.wallet_exists(user)?` and the menu branch.
-    let text = ui::welcome(ctx.core.network(), false);
+    let has_wallet = match msg.from.as_ref() {
+        #[allow(clippy::cast_possible_wrap)]
+        Some(from) => {
+            let user = ctx.users.resolve(from.id.0 as i64)?;
+            ctx.core.wallet_exists(user)?
+        }
+        None => false,
+    };
+
+    let text = ui::welcome(ctx.core.network(), has_wallet);
     bot.send_message(msg.chat.id, text)
         .parse_mode(ParseMode::Html)
         .await?;
@@ -26,8 +33,12 @@ pub async fn help(bot: Bot, msg: Message) -> Result<()> {
 pub async fn status(bot: Bot, msg: Message, ctx: Ctx) -> Result<()> {
     match ctx.core.status().await {
         Ok(s) => {
-            // Step 3 fills in the session; there is no session store yet.
-            bot.send_message(msg.chat.id, ui::status(&s, None))
+            let session = msg.from.as_ref().and_then(|from| {
+                #[allow(clippy::cast_possible_wrap)]
+                let user = ctx.users.resolve(from.id.0 as i64).ok()?;
+                ctx.core.session(user).map(|info| info.remaining)
+            });
+            bot.send_message(msg.chat.id, ui::status(&s, session))
                 .parse_mode(ParseMode::Html)
                 .await?;
         }
@@ -53,7 +64,8 @@ pub async fn network(bot: Bot, msg: Message, ctx: Ctx) -> Result<()> {
 pub async fn not_yet(bot: Bot, msg: Message) -> Result<()> {
     bot.send_message(
         msg.chat.id,
-        "That command isn't wired up in this build yet. /status and /network work.",
+        "That command isn't wired up in this build yet. /create, /restore, /unlock, \
+         /lock, /export, /delete, /status and /network work.",
     )
     .await?;
     Ok(())

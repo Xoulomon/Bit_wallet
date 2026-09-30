@@ -7,30 +7,50 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
-use std::{path::Path, sync::Mutex};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
 use wallet_core::types::UserId;
 
+/// Open `bot.sqlite`. The connection is shared with the dialogue store, which
+/// adds its own table to it: both are front-end state, and neither has any
+/// business in core's database (§3a rule 3, §8.4).
+pub fn open_bot_db(path: &Path) -> Result<Connection> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let db = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+    db.execute_batch("PRAGMA journal_mode=WAL;")
+        .context("configuring bot.sqlite")?;
+    Ok(db)
+}
+
 pub struct UserStore {
-    db: Mutex<Connection>,
+    db: Arc<Mutex<Connection>>,
 }
 
 impl UserStore {
-    pub fn open(path: &Path) -> Result<Self> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    pub fn new(db: Arc<Mutex<Connection>>) -> Result<Self> {
+        {
+            let conn = db
+                .lock()
+                .map_err(|_| anyhow::anyhow!("user store mutex poisoned"))?;
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS telegram_users (
+                     tg_id      INTEGER PRIMARY KEY,
+                     user_id    TEXT NOT NULL UNIQUE,
+                     is_admin   INTEGER NOT NULL DEFAULT 0,
+                     created_at INTEGER NOT NULL
+                 );",
+            )
+            .context("creating telegram_users")?;
         }
-        let db = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
-        db.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             CREATE TABLE IF NOT EXISTS telegram_users (
-                 tg_id      INTEGER PRIMARY KEY,
-                 user_id    TEXT NOT NULL UNIQUE,
-                 is_admin   INTEGER NOT NULL DEFAULT 0,
-                 created_at INTEGER NOT NULL
-             );",
-        )
-        .context("creating telegram_users")?;
-        Ok(UserStore { db: Mutex::new(db) })
+        Ok(UserStore { db })
+    }
+
+    pub fn open(path: &Path) -> Result<Self> {
+        UserStore::new(Arc::new(Mutex::new(open_bot_db(path)?)))
     }
 
     /// The `UserId` for this Telegram id, minting one on first contact (§8.7).

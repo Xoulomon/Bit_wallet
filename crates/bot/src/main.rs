@@ -8,13 +8,15 @@
 
 mod auth;
 mod commands;
+mod dialogue;
 mod handlers;
 mod ui;
 mod users;
 
 use anyhow::{Context, Result};
 use commands::Command;
-use std::sync::Arc;
+use dialogue::{SqliteDialogueStore, State};
+use std::sync::{Arc, Mutex};
 use teloxide::{dispatching::UpdateFilterExt, prelude::*, utils::command::BotCommands};
 use wallet_core::{AppConfig, WalletService};
 
@@ -43,11 +45,16 @@ async fn main() -> Result<()> {
         .await
         .context("connecting to the Bitcoin backend")?;
 
+    // One connection, two tables: the tg_id map and the dialogue states. They
+    // share a file because they are the same kind of thing — front-end state
+    // that core must never see (§3a rule 3, §8.4).
+    let bot_conn = Arc::new(Mutex::new(users::open_bot_db(&bot_db)?));
     let ctx = Ctx {
         core,
-        users: Arc::new(users::UserStore::open(&bot_db)?),
+        users: Arc::new(users::UserStore::new(Arc::clone(&bot_conn))?),
         policy: Arc::new(auth::Policy::from_env()),
     };
+    let dialogues = SqliteDialogueStore::new(bot_conn)?;
 
     let bot = Bot::from_env();
     bot.set_my_commands(Command::bot_commands())
@@ -57,7 +64,7 @@ async fn main() -> Result<()> {
     tracing::info!("dispatching");
 
     Dispatcher::builder(bot, schema())
-        .dependencies(dptree::deps![ctx])
+        .dependencies(dptree::deps![ctx, dialogues])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
@@ -66,8 +73,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// The update tree. The guard of §8.7 runs *before* any handler, so a group
-/// chat never reaches wallet code at all.
+/// The update tree (§8).
+///
+/// The guard of §8.7 runs *before* anything else, so a group chat never reaches
+/// wallet code at all. Commands are matched before dialogue states, which is
+/// what lets a user type /start to escape a flow they no longer want.
 fn schema() -> teloxide::dispatching::UpdateHandler<anyhow::Error> {
     use dptree::case;
 
@@ -76,11 +86,41 @@ fn schema() -> teloxide::dispatching::UpdateHandler<anyhow::Error> {
         .branch(case![Command::Help].endpoint(handlers::start::help))
         .branch(case![Command::Status].endpoint(handlers::start::status))
         .branch(case![Command::Network].endpoint(handlers::start::network))
+        .branch(case![Command::Create].endpoint(handlers::wallet::create))
+        .branch(case![Command::Restore].endpoint(handlers::wallet::restore))
+        .branch(case![Command::Unlock].endpoint(handlers::wallet::unlock))
+        .branch(case![Command::Lock].endpoint(handlers::wallet::lock))
+        .branch(case![Command::Export].endpoint(handlers::wallet::export))
+        .branch(case![Command::Delete].endpoint(handlers::wallet::delete))
         .endpoint(handlers::start::not_yet);
+
+    // §8.4: every state that expects text has exactly one endpoint, so
+    // delete-on-receipt and the retry counter are written once each.
+    let states = dptree::entry()
+        .branch(case![State::RestoreMnemonic].endpoint(handlers::wallet::receive_mnemonic))
+        .branch(
+            case![State::RestoreBirthday { words }].endpoint(handlers::wallet::receive_birthday),
+        )
+        .branch(case![State::SetPin { intent }].endpoint(handlers::wallet::receive_new_pin))
+        .branch(
+            case![State::ConfirmPin { intent, first }]
+                .endpoint(handlers::wallet::receive_pin_confirmation),
+        )
+        .branch(
+            case![State::CreateConfirmWords {
+                challenge,
+                answered
+            }]
+            .endpoint(handlers::wallet::receive_backup_word),
+        )
+        .branch(case![State::AwaitPin { pending }].endpoint(handlers::wallet::receive_pin))
+        .branch(case![State::DeleteTypeConfirm].endpoint(handlers::wallet::receive_delete_word));
 
     Update::filter_message()
         .branch(dptree::filter_map(guard).endpoint(refuse))
+        .enter_dialogue::<Message, SqliteDialogueStore, State>()
         .branch(commands)
+        .branch(states)
 }
 
 /// Yields a refusal only when the message must not be served (§8.7); `None`

@@ -4,3 +4,4 @@
 //! bitcoin logic is a bug in the layering, not a shortcut.
 
 pub mod start;
+pub mod wallet;

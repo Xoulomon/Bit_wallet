@@ -8,9 +8,18 @@ license.workspace = true
 [dependencies]
 anyhow = "1.0.104"
 dotenvy = "0.15.7"
+futures = "0.3.34"
 rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+# `sqlite-storage-*` is deliberately off: it pulls sqlx's libsqlite3-sys, which
+# collides with the one bdk_wallet's rusqlite links. Dialogue state is persisted
+# by `dialogue::SqliteDialogueStore` over the same rusqlite this crate already
+# uses for bot.sqlite (§8.4).
 teloxide = { version = "0.17.0", features = ["macros"] }
+thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 wallet-core = { version = "0.1.0", path = "../wallet-core" }
+zeroize = "1.9.0"

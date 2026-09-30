@@ -212,6 +212,148 @@ fn render_backend_error(e: &BackendError) -> String {
     }
 }
 
+// ---------------------------------------------------------------- lifecycle
+// The wording of §5 and §8.1: what is about to happen, why it matters, and
+// what the user must do. No step asks for a secret without saying what becomes
+// of it.
+
+pub fn ask_pin_new() -> String {
+    "<b>Choose a PIN</b>\n\n\
+     6–8 digits. It encrypts your seed phrase on this server, and it is the only \
+     thing standing between someone with the database and your coins.\n\n\
+     There is no way to reset it. Send it now — I'll delete your message straight away."
+        .into()
+}
+
+pub fn ask_pin_again() -> String {
+    "Send the same PIN once more, so a typo can't lock you out.".into()
+}
+
+pub fn pin_mismatch() -> String {
+    "Those two didn't match. Let's start the PIN again — send the one you want.".into()
+}
+
+pub fn ask_pin() -> String {
+    "Send your PIN. I'll delete the message as soon as it arrives.".into()
+}
+
+pub fn ask_mnemonic() -> String {
+    "<b>Send your seed phrase</b>\n\n\
+     12 or 24 words, in order, separated by spaces. I'll delete your message the \
+     instant it arrives.\n\n\
+     Only do this in a chat you trust, on a device you trust."
+        .into()
+}
+
+pub fn ask_birthday() -> String {
+    "<b>When was this wallet first used?</b>\n\n\
+     Send the block height if you know it — scanning starts there instead of from \
+     the beginning of the chain, which is much faster.\n\n\
+     Send <code>skip</code> if you don't know."
+        .into()
+}
+
+/// §6: the front end renders the verdict; the policy behind it is core's.
+pub fn restore_plan(network: Network, plan: &wallet_core::types::RestorePlan) -> String {
+    use wallet_core::types::RestoreVerdict;
+
+    let head = format!("{}\n\n<b>Restore</b>", badge(network));
+    let depth = format!(
+        "\nFrom block {} to {} — {} blocks.",
+        group(u64::from(plan.birthday)),
+        group(u64::from(plan.tip)),
+        group(u64::from(plan.depth))
+    );
+
+    match &plan.verdict {
+        RestoreVerdict::Proceed => format!("{head}{depth}\n\nThis will be quick."),
+        RestoreVerdict::Warn => format!(
+            "{head}{depth}\n\n⏳ Scanning that far back takes about {}. \
+             You can keep using the chat meanwhile; balances will fill in as it goes.",
+            duration(plan.eta)
+        ),
+        RestoreVerdict::Refuse { max } => format!(
+            "{head}{depth}\n\n❌ That's more than this bot will scan ({} blocks, about {}).\n\n\
+             The limit exists because every block costs calls against a shared, rate-limited \
+             backend. If you know a later block height for this wallet, send /restore again \
+             and use it.",
+            group(u64::from(*max)),
+            duration(plan.eta)
+        ),
+    }
+}
+
+pub fn duration(d: std::time::Duration) -> String {
+    let mins = d.as_secs() / 60;
+    match mins {
+        0 => "under a minute".into(),
+        1..=90 => format!("{mins} minutes"),
+        _ => format!("{} hours", mins / 60),
+    }
+}
+
+/// §5, §8.1: shown once, in a message that removes itself after 60 seconds.
+pub fn mnemonic_card(words: &str) -> String {
+    format!(
+        "<b>Write these down, in order, on paper.</b>\n\n\
+         <tg-spoiler><code>{}</code></tg-spoiler>\n\n\
+         ⏳ This message deletes itself in 60 seconds.\n\n\
+         Anyone with these words has your coins. Never type them into anything that \
+         asks for them — including, after today, this bot.",
+        escape(words)
+    )
+}
+
+pub fn ask_backup_word(index: u8, nth: usize) -> String {
+    format!(
+        "<b>Check {nth} of 3</b>\n\nWhat is word number {}?",
+        index as usize + 1
+    )
+}
+
+pub fn wallet_ready(network: Network) -> String {
+    format!(
+        "{}\n\n✅ <b>Your wallet is ready.</b>\n\n\
+         /receive — an address to be paid at\n\
+         /balance — what you hold\n\
+         /send — pay someone",
+        badge(network)
+    )
+}
+
+pub fn restored(network: Network) -> String {
+    format!(
+        "{}\n\n✅ <b>Restored.</b> Scanning for your history now — /balance will fill \
+         in as it goes.",
+        badge(network)
+    )
+}
+
+pub fn unlocked(remaining: std::time::Duration) -> String {
+    format!("🔓 Unlocked for {} minutes.", remaining.as_secs() / 60)
+}
+
+pub fn locked() -> String {
+    "🔒 Locked.".into()
+}
+
+pub fn ask_delete_word() -> String {
+    "<b>Delete this wallet?</b>\n\n\
+     Your seed phrase and every address this bot knows for you will be erased here. \
+     If you have the words written down you can restore later; if you don't, the \
+     coins are gone.\n\n\
+     Type <code>DELETE</code> in capitals to continue, or anything else to stop."
+        .into()
+}
+
+pub fn delete_cancelled() -> String {
+    "Nothing deleted.".into()
+}
+
+pub fn deleted() -> String {
+    "Wallet deleted. <b>/restore</b> brings it back if you have the seed phrase.".into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +385,88 @@ mod tests {
     fn every_error_renders_to_a_sentence_with_a_next_step() {
         let rendered = render_error(&CoreError::Locked);
         assert!(rendered.contains("/unlock"));
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::time::Duration;
+    use wallet_core::types::{RestorePlan, RestoreVerdict};
+
+    fn plan(depth: u32, verdict: RestoreVerdict, eta_secs: u64) -> RestorePlan {
+        RestorePlan {
+            birthday: 900_000 - depth,
+            tip: 900_000,
+            depth,
+            eta: Duration::from_secs(eta_secs),
+            verdict,
+        }
+    }
+
+    /// §8.1: a mnemonic message says, on the message itself, that it will go.
+    #[test]
+    fn the_mnemonic_card_warns_that_it_self_destructs() {
+        let card = mnemonic_card("abandon abandon about");
+        assert!(card.contains("60 seconds"));
+        assert!(card.contains("paper"));
+        assert!(card.contains("abandon abandon about"));
+    }
+
+    #[test]
+    fn a_refused_restore_says_why_and_what_to_do_instead() {
+        let rendered = restore_plan(
+            Network::Bitcoin,
+            &plan(500_000, RestoreVerdict::Refuse { max: 10_000 }, 900_000),
+        );
+        assert!(rendered.starts_with("🟠 MAINNET"));
+        assert!(rendered.contains("10,000"));
+        assert!(
+            rendered.contains("/restore"),
+            "a refusal must name the next step"
+        );
+    }
+
+    #[test]
+    fn a_warned_restore_quotes_the_wait_rather_than_just_warning() {
+        let rendered = restore_plan(Network::Regtest, &plan(5_000, RestoreVerdict::Warn, 9_000));
+        assert!(rendered.contains("hours") || rendered.contains("minutes"));
+    }
+
+    #[test]
+    fn a_quick_restore_says_nothing_alarming() {
+        let rendered = restore_plan(Network::Regtest, &plan(50, RestoreVerdict::Proceed, 5));
+        assert!(!rendered.contains('❌'));
+        assert!(rendered.contains("quick"));
+    }
+
+    #[test]
+    fn durations_read_as_english() {
+        assert_eq!(duration(Duration::from_secs(30)), "under a minute");
+        assert_eq!(duration(Duration::from_secs(600)), "10 minutes");
+        assert_eq!(duration(Duration::from_secs(7_200)), "2 hours");
+    }
+
+    /// §5: the PIN prompt has to say that it cannot be reset, because the user
+    /// is choosing it in the three seconds before they forget it.
+    #[test]
+    fn the_pin_prompt_states_the_consequence_of_losing_it() {
+        let prompt = ask_pin_new();
+        assert!(prompt.contains("no way to reset"));
+        assert!(prompt.contains("delete your message"));
+    }
+
+    #[test]
+    fn the_delete_prompt_requires_a_typed_word_and_names_the_risk() {
+        let prompt = ask_delete_word();
+        assert!(prompt.contains("DELETE"));
+        assert!(prompt.contains("gone"));
+    }
+
+    #[test]
+    fn a_backup_question_is_one_based_for_a_human() {
+        // Core counts from zero; a user counts from one.
+        assert!(ask_backup_word(0, 1).contains("word number 1"));
+        assert!(ask_backup_word(11, 3).contains("word number 12"));
     }
 }
