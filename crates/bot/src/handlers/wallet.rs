@@ -425,6 +425,25 @@ pub async fn receive_pin(
             Err(e) => return retry_or_fail(&bot, &msg, &dialogue, &e).await,
         },
 
+        PendingAction::PayjoinReceive { sats } => {
+            // The PIN opens the session; the URI then goes out the same way it
+            // would have without a lock.
+            match ctx.core.unlock(user, &pin).await {
+                Ok(_) => {
+                    dialogue.exit().await?;
+                    return crate::handlers::payjoin::open_session(
+                        &bot,
+                        msg.chat.id,
+                        &ctx,
+                        user,
+                        sats,
+                    )
+                    .await;
+                }
+                Err(e) => return retry_or_fail(&bot, &msg, &dialogue, &e).await,
+            }
+        }
+
         PendingAction::Send { quote } => {
             // The PIN opens a session inside `confirm_send`, so the same call
             // both authorises and signs — the bot never learns whether a seed

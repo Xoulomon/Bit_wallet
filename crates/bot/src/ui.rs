@@ -1390,6 +1390,21 @@ pub fn payjoin_usage(network: Network) -> String {
     )
 }
 
+/// A payjoin that could not even start. Distinct from one that failed midway,
+/// because the cause is almost always the directory or relay being unreachable
+/// and the operator is the person who can fix it (§8.1: a next step).
+pub fn payjoin_unavailable(e: &CoreError) -> String {
+    match e {
+        CoreError::Payjoin(reason) => format!(
+            "Couldn't start a payjoin request — the payjoin directory or relay didn't \
+             answer. Nothing was sent, and /receive still works for an ordinary \
+             payment.\n\n<code>{}</code>",
+            escape(reason)
+        ),
+        other => render_error(other),
+    }
+}
+
 pub fn payjoin_cancelled() -> String {
     "Payjoin session cancelled.".into()
 }

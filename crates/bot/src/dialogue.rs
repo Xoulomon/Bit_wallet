@@ -23,6 +23,11 @@ pub enum PendingAction {
     Send {
         quote: String,
     },
+    /// Open a payjoin receiving session, which needs the seed to contribute an
+    /// input and sign the proposal (§7).
+    PayjoinReceive {
+        sats: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -263,6 +268,23 @@ mod tests {
         );
         assert!(!State::Start.expects_secret());
         assert!(!State::DeleteTypeConfirm.expects_secret());
+    }
+
+    /// §8.4: a flow must survive a restart, and a state that cannot be read
+    /// back silently returns the user to Start — mid-payjoin, that would lose
+    /// the amount they asked for.
+    #[test]
+    fn a_pending_payjoin_receive_survives_a_restart() {
+        let waiting = State::AwaitPin {
+            pending: PendingAction::PayjoinReceive { sats: 25_000 },
+        };
+        let encoded = serde_json::to_string(&waiting).expect("serialises");
+        let back: State = serde_json::from_str(&encoded).expect("deserialises");
+        assert_eq!(waiting, back);
+
+        // And it is one of the states that expects a secret, so the handler
+        // deletes the message carrying it.
+        assert!(waiting.expects_secret());
     }
 
     #[test]
