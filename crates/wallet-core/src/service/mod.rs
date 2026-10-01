@@ -45,6 +45,43 @@ pub struct WalletService {
     payjoin: Arc<crate::payjoin::persist::SessionStore>,
 }
 
+/// Borrow an address from one of the node's own wallets, for a `/mine` with no
+/// destination.
+///
+/// This is the only call in the project that touches a node wallet, and it has
+/// to name which one: Polar loads several, and Core then refuses a bare
+/// `getnewaddress` with -19 rather than guessing. Prefer passing an address and
+/// skipping all of this.
+fn node_address(cfg: &AppConfig, client: &bitcoincore_rpc::Client) -> Result<Address> {
+    use bitcoincore_rpc::RpcApi as _;
+
+    let regtest = match &cfg.backend {
+        BackendConfig::Regtest(r) => r,
+        BackendConfig::Bitrpc(_) => {
+            return Err(CoreError::UnsupportedOnNetwork {
+                network: cfg.network.network(),
+            });
+        }
+    };
+
+    let loaded = client
+        .list_wallets()
+        .map_err(crate::rpc::map_rpc_error("listwallets"))?;
+
+    let scoped = match loaded.first() {
+        Some(name) => crate::rpc::polar::wallet_client(regtest, name)?,
+        // No wallet loaded at all: the bare client is unambiguous, and Core
+        // will say so clearly if there is genuinely nowhere to put an address.
+        None => crate::rpc::polar::client(regtest)?,
+    };
+
+    scoped
+        .get_new_address(None, None)
+        .map_err(crate::rpc::map_rpc_error("getnewaddress"))?
+        .require_network(cfg.network.network())
+        .map_err(|e| CoreError::Wallet(e.to_string()))
+}
+
 /// A fee bump keeps the original recipient; find it among the outputs that are
 /// not ours.
 fn wallet_recipient(draft: &crate::onchain::wallet::Draft, network: Network) -> Result<Address> {
@@ -825,13 +862,12 @@ impl WalletService {
             let source = ChainSource::connect(&cfg)?;
             let client = source.client();
 
+            // With an address in hand, no node wallet is involved at all:
+            // `generatetoaddress` is a generating RPC, not a wallet one. That
+            // is the path every caller should take.
             let address = match to {
                 Some(a) => a,
-                None => client
-                    .get_new_address(None, None)
-                    .map_err(crate::rpc::map_rpc_error("getnewaddress"))?
-                    .require_network(cfg.network.network())
-                    .map_err(|e| CoreError::Wallet(e.to_string()))?,
+                None => node_address(&cfg, &client)?,
             };
 
             client

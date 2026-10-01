@@ -28,11 +28,29 @@ pub async fn mine(bot: Bot, msg: Message, ctx: Ctx, blocks: String) -> Result<()
         return Ok(());
     }
 
-    match ctx.core.mine(count, None).await {
+    // Mine to the caller's own wallet. Two reasons, and the second is the one
+    // that bites: `/mine 101` then actually funds the person who typed it,
+    // which is what they wanted; and supplying an address means core never
+    // calls `getnewaddress`, so it never has to pick among the node's own
+    // wallets — Polar loads several, and Core refuses a bare wallet call.
+    //
+    // If the caller has no wallet yet, fall through to core's own choice: an
+    // admin mining before /create is setting up a chain, not funding himself.
+    let user = ctx.users.resolve(tg)?;
+    let to = match ctx.core.wallet_exists(user) {
+        Ok(true) => ctx.core.next_address(user).await.ok().map(|a| a.address),
+        _ => None,
+    };
+    let to_self = to.is_some();
+
+    match ctx.core.mine(count, to).await {
         Ok(hashes) => {
-            bot.send_message(msg.chat.id, ui::mined(ctx.core.network(), hashes.len()))
-                .parse_mode(ParseMode::Html)
-                .await?;
+            bot.send_message(
+                msg.chat.id,
+                ui::mined(ctx.core.network(), hashes.len(), to_self),
+            )
+            .parse_mode(ParseMode::Html)
+            .await?;
         }
         Err(e) => return crate::handlers::reply_error(&bot, &msg, &e).await,
     }

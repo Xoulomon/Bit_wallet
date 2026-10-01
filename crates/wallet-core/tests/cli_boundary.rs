@@ -337,3 +337,66 @@ async fn a_wallet_is_readable_by_a_process_that_never_held_the_session() {
 
     core.shutdown().await;
 }
+
+/// `/mine` with no address must work on a node that has several wallets
+/// loaded, as Polar's does.
+///
+/// Regression: core called a bare `getnewaddress`, and Core refuses that with
+/// -19 ("Multiple wallets are loaded…") rather than picking one. The shell
+/// helper had the same bug and was fixed without the Rust being fixed too,
+/// which is how it reached a user.
+#[tokio::test(flavor = "multi_thread")]
+async fn mining_without_an_address_works_with_several_node_wallets_loaded() {
+    let (node, cfg, _dir) = harness();
+
+    // Load a second wallet, so a bare wallet RPC becomes ambiguous.
+    node.client
+        .create_wallet("second")
+        .expect("a second wallet loads");
+
+    let core = WalletService::new(cfg).await.expect("service starts");
+    let before = core.status().await.expect("status").tip_height;
+
+    let hashes = core
+        .mine(2, None)
+        .await
+        .expect("mining must not depend on which node wallet is default");
+    assert_eq!(hashes.len(), 2);
+    assert_eq!(core.status().await.expect("status").tip_height, before + 2);
+
+    core.shutdown().await;
+}
+
+/// Mining to a supplied address touches no node wallet at all, which is the
+/// path the bot takes.
+#[tokio::test(flavor = "multi_thread")]
+async fn mining_to_a_given_address_credits_that_wallet() {
+    let (node, cfg, _dir) = harness();
+    node.client
+        .create_wallet("another")
+        .expect("a second wallet loads");
+
+    let core = WalletService::new(cfg).await.expect("service starts");
+    let alice = UserId::new();
+    core.create_wallet(alice, &Pin::new("864213"))
+        .await
+        .expect("creates");
+
+    let address = core.next_address(alice).await.expect("address").address;
+    core.mine(101, Some(address)).await.expect("mines to alice");
+    core.sync_now(alice).await.expect("syncs");
+
+    // A coinbase needs 100 confirmations, so the first reward is now spendable
+    // and the rest are not. Either way the money is hers, not the node's.
+    let balance = core.balance(alice).await.expect("balance");
+    assert!(
+        balance.total > Amount::ZERO,
+        "mining to her address credited her wallet"
+    );
+    assert!(
+        balance.immature > Amount::ZERO,
+        "recent coinbase outputs are immature, which the UI has to say"
+    );
+
+    core.shutdown().await;
+}

@@ -1078,8 +1078,17 @@ pub fn send_cancelled() -> String {
     "Cancelled. Nothing was sent.".into()
 }
 
-pub fn mined(network: Network, blocks: usize) -> String {
-    format!("{} · ⛏ Mined {blocks} block(s).", badge(network))
+pub fn mined(network: Network, blocks: usize, to_self: bool) -> String {
+    let mut out = format!("{} · ⛏ Mined {blocks} block(s).", badge(network));
+    if to_self {
+        // A coinbase output needs 100 confirmations before it can be spent, so
+        // say so rather than let /balance look broken.
+        out.push_str(
+            "\n\nThe rewards are yours, but a freshly mined coin needs 100 more blocks \
+             before it can be spent — it shows under immature until then.",
+        );
+    }
+    out
 }
 
 #[cfg(test)]
