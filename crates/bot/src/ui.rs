@@ -126,7 +126,7 @@ pub fn network_card(network: Network) -> String {
         _ => {
             "A private test chain. These coins are worth nothing — which is exactly what \
              makes it the right place to learn the flows.\n\n\
-             /mine <n> mints blocks (admins only)."
+             <code>/mine 101</code> mints blocks (admins only)."
         }
     };
     format!(
@@ -727,7 +727,13 @@ pub fn incoming(amount: Amount, status: TxStatus) -> String {
 }
 
 pub fn confirmed(txid: &str, confirmations: u32) -> String {
-    format!("✅ {} — {} confs", shorten(txid), confirmations)
+    // Short in the sentence so it reads, whole in a code block so it is usable.
+    format!(
+        "✅ {} — {} confs\n<code>{}</code>",
+        shorten(txid),
+        confirmations,
+        escape(txid)
+    )
 }
 
 pub fn session_expired() -> String {
@@ -1068,13 +1074,34 @@ pub fn broadcasting() -> String {
 }
 
 pub fn broadcast_done(network: Network, b: &Broadcast) -> String {
-    format!(
-        "{} · 📡 <b>Sent</b>\n\n<code>{}</code>\n{} + {} fee\n\nTracking confirmations.",
+    // The *whole* txid, in a code block so a tap copies it. A shortened one
+    // looks tidier and is useless: it cannot be pasted into /tx or /bumpfee,
+    // and it cannot be looked up anywhere.
+    let txid = b.txid.to_string();
+
+    let mut out = format!(
+        "{} · 📡 <b>Sent</b>\n\n<code>{}</code>\n\n{} + {} fee\n\nTracking confirmations.",
         badge(network),
-        escape(&shorten(&b.txid.to_string())),
+        escape(&txid),
         sats(b.amount),
         sats(b.fee)
-    )
+    );
+
+    if b.payjoin {
+        out.push_str("\n🤝 Payjoin ✅");
+    }
+
+    out.push_str(&format!(
+        "\n\n<code>/tx {txid}</code>\n<code>/bumpfee {txid}</code>"
+    ));
+
+    if network == Network::Bitcoin {
+        out.push_str(&format!(
+            "\n\n<a href=\"https://mempool.space/tx/{txid}\">See it on mempool.space</a>"
+        ));
+    }
+
+    out
 }
 
 pub fn send_usage(network: Network) -> String {
@@ -1532,5 +1559,382 @@ mod payjoin_tests {
             assert!(!payjoin_badge(&state).is_empty());
             assert!(!payjoin_state_text(&state).is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod html_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+    use wallet_core::bitcoin::Txid;
+    use wallet_core::types::{
+        BalanceView, Broadcast, FeeLabel, FeeOptions, FeeSource, Page, Paged, PayjoinReceipt,
+        PayjoinRole, PayjoinSessionView, PayjoinState, QuoteId, RestorePlan, RestoreVerdict,
+        SendQuote, SessionId, TxDirection, TxStatus, TxSummary,
+    };
+
+    /// Every tag Telegram accepts in `ParseMode::Html`. Anything else makes it
+    /// reject the *whole* message, so a stray `<n>` in prose takes a command
+    /// down completely — which is exactly what happened to /network:
+    ///
+    ///     Bad Request: can't parse entities: Unsupported start tag "n"
+    const ALLOWED: [&str; 14] = [
+        "b",
+        "strong",
+        "i",
+        "em",
+        "u",
+        "ins",
+        "s",
+        "strike",
+        "del",
+        "span",
+        "tg-spoiler",
+        "a",
+        "code",
+        "pre",
+    ];
+
+    /// Reject what Telegram would reject: an angle bracket that opens a tag it
+    /// does not know.
+    fn assert_sendable(label: &str, text: &str) {
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b'<' {
+                i += 1;
+                continue;
+            }
+
+            let rest = &text[i + 1..];
+            let end = rest
+                .find('>')
+                .unwrap_or_else(|| panic!("{label}: unterminated `<` at byte {i}:\n{text}"));
+            let inner = &rest[..end];
+
+            // Closing tags, and attributes on an opening tag.
+            let name = inner
+                .trim_start_matches('/')
+                .split([' ', '='])
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+
+            assert!(
+                ALLOWED.contains(&name.as_str()),
+                "{label}: `<{inner}>` is not a tag Telegram accepts, so it would reject \
+                 the whole message. Escape it with ui::escape, or write it as \
+                 &lt;{inner}&gt;.\n\nFull text:\n{text}"
+            );
+            i += 1 + end + 1;
+        }
+    }
+
+    fn txid(b: u8) -> Txid {
+        Txid::from_raw_hash(wallet_core::bitcoin::hashes::Hash::from_byte_array([b; 32]))
+    }
+
+    fn address() -> wallet_core::bitcoin::Address {
+        "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"
+            .parse::<wallet_core::bitcoin::Address<_>>()
+            .expect("parses")
+            .require_network(Network::Bitcoin)
+            .expect("mainnet")
+    }
+
+    /// §8.1 says every message is a sentence with a next step. It also has to
+    /// *arrive*, and a message Telegram refuses arrives as nothing at all.
+    #[test]
+    fn every_message_is_valid_telegram_html() {
+        for network in [Network::Regtest, Network::Bitcoin] {
+            // The one that was broken.
+            assert_sendable("network_card", &network_card(network));
+
+            assert_sendable("welcome/new", &welcome(network, false));
+            assert_sendable("welcome/has", &welcome(network, true));
+            assert_sendable("wallet_ready", &wallet_ready(network));
+            assert_sendable("restored", &restored(network));
+            assert_sendable("quote_expired", &quote_expired_card(network));
+            assert_sendable("send_usage", &send_usage(network));
+            assert_sendable("payjoin_usage", &payjoin_usage(network));
+            assert_sendable("mined/self", &mined(network, 101, true));
+            assert_sendable("mined/node", &mined(network, 1, false));
+
+            let b = Broadcast {
+                txid: txid(1),
+                amount: Amount::from_sat(50_000),
+                fee: Amount::from_sat(410),
+                payjoin: false,
+            };
+            assert_sendable("broadcast_done", &broadcast_done(network, &b));
+            assert_sendable(
+                "broadcast_done/payjoin",
+                &broadcast_done(network, &Broadcast { payjoin: true, ..b }),
+            );
+
+            let view = BalanceView {
+                confirmed: Amount::from_sat(100_000),
+                trusted_pending: Amount::from_sat(1),
+                untrusted_pending: Amount::from_sat(2),
+                immature: Amount::from_sat(3),
+                total: Amount::from_sat(100_006),
+                unconfirmed_incoming_visible: network == Network::Regtest,
+            };
+            assert_sendable("balance", &balance(network, &view));
+
+            let info = AddressInfo {
+                address: address(),
+                index: 0,
+                used: false,
+                received: Amount::ZERO,
+                bip21: "bitcoin:bc1qexample".into(),
+            };
+            assert_sendable("receive", &receive(network, &info));
+            assert_sendable(
+                "addresses",
+                &addresses(
+                    network,
+                    &Paged {
+                        items: vec![info.clone()],
+                        page: Page::new(0),
+                        total: 1,
+                    },
+                ),
+            );
+            assert_sendable(
+                "addresses/empty",
+                &addresses(
+                    network,
+                    &Paged {
+                        items: vec![],
+                        page: Page::new(0),
+                        total: 0,
+                    },
+                ),
+            );
+
+            let summary = TxSummary {
+                txid: txid(2),
+                direction: TxDirection::Incoming,
+                amount: Amount::from_sat(25_000),
+                fee: Some(Amount::from_sat(300)),
+                status: TxStatus::Confirmed {
+                    height: 100,
+                    confirmations: 3,
+                },
+                timestamp: None,
+            };
+            assert_sendable(
+                "history",
+                &history(
+                    network,
+                    &Paged {
+                        items: vec![summary.clone()],
+                        page: Page::new(0),
+                        total: 1,
+                    },
+                ),
+            );
+            assert_sendable(
+                "history/empty",
+                &history(
+                    network,
+                    &Paged {
+                        items: vec![],
+                        page: Page::new(0),
+                        total: 0,
+                    },
+                ),
+            );
+            assert_sendable(
+                "tx_detail",
+                &tx_detail(
+                    network,
+                    &wallet_core::types::TxDetail {
+                        summary,
+                        fee_rate: FeeRate::from_sat_per_vb(6),
+                        inputs: 1,
+                        outputs: 2,
+                        vsize: 141,
+                    },
+                ),
+            );
+
+            let fees = FeeOptions {
+                presets: vec![(FeeLabel::Normal, FeeRate::from_sat_per_vb(6).expect("ok"))],
+                floor: FeeRate::from_sat_per_vb(1).expect("ok"),
+                source: FeeSource::External {
+                    name: "mempool.space".into(),
+                },
+                allows_custom: true,
+            };
+            assert_sendable(
+                "fee_card",
+                &fee_card(network, Some(Amount::from_sat(1)), "bc1q", &fees),
+            );
+
+            let quote = SendQuote {
+                id: QuoteId::new(),
+                recipient: address(),
+                amount: Amount::from_sat(50_000),
+                fee: Amount::from_sat(410),
+                fee_rate: FeeRate::from_sat_per_vb(6).expect("ok"),
+                total: Amount::from_sat(50_410),
+                change: Amount::from_sat(1_000),
+                is_payjoin: true,
+                payjoin_uri: None,
+                replaces: Some(txid(3)),
+                expires_at: SystemTime::now() + Duration::from_secs(300),
+            };
+            assert_sendable("confirm_card", &confirm_card(network, &quote));
+
+            let receipt = PayjoinReceipt {
+                session_id: SessionId::new(),
+                bip21: "bitcoin:bc1qexample?amount=0.0005&pj=https://payjo.in/X".into(),
+                expires_at: SystemTime::now(),
+            };
+            assert_sendable(
+                "payjoin_receipt",
+                &payjoin_receipt(network, Amount::from_sat(25_000), &receipt),
+            );
+            assert_sendable(
+                "payjoin_sessions",
+                &payjoin_sessions(
+                    network,
+                    &[PayjoinSessionView {
+                        id: SessionId::new(),
+                        role: PayjoinRole::Receiver,
+                        state: PayjoinState::Waiting,
+                        amount: None,
+                        created_at: SystemTime::now(),
+                        expires_at: SystemTime::now(),
+                    }],
+                ),
+            );
+            assert_sendable("payjoin_sessions/empty", &payjoin_sessions(network, &[]));
+
+            for depth in [50u32, 5_000, 500_000] {
+                let verdict = match depth {
+                    50 => RestoreVerdict::Proceed,
+                    5_000 => RestoreVerdict::Warn,
+                    _ => RestoreVerdict::Refuse { max: 10_000 },
+                };
+                assert_sendable(
+                    "restore_plan",
+                    &restore_plan(
+                        network,
+                        &RestorePlan {
+                            birthday: 0,
+                            tip: depth,
+                            depth,
+                            eta: Duration::from_secs(600),
+                            verdict,
+                        },
+                    ),
+                );
+            }
+        }
+
+        // The prompts, which have no network in them.
+        assert_sendable("ask_pin_new", &ask_pin_new());
+        assert_sendable("ask_pin_again", &ask_pin_again());
+        assert_sendable("ask_pin", &ask_pin());
+        assert_sendable("pin_mismatch", &pin_mismatch());
+        assert_sendable("ask_mnemonic", &ask_mnemonic());
+        assert_sendable("ask_birthday", &ask_birthday());
+        assert_sendable("ask_delete_word", &ask_delete_word());
+        assert_sendable("deleted", &deleted());
+        assert_sendable("delete_cancelled", &delete_cancelled());
+        assert_sendable("mnemonic_card", &mnemonic_card("abandon abandon about"));
+        assert_sendable("ask_backup_word", &ask_backup_word(0, 1));
+        assert_sendable("unlocked", &unlocked(Duration::from_secs(600)));
+        assert_sendable("locked", &locked());
+        assert_sendable("broadcasting", &broadcasting());
+        assert_sendable("send_cancelled", &send_cancelled());
+        assert_sendable("payjoin_cancelled", &payjoin_cancelled());
+        assert_sendable(
+            "ask_custom_fee",
+            &ask_custom_fee(FeeRate::from_sat_per_vb(1).expect("ok")),
+        );
+        assert_sendable("unrecognised/cmd", &unrecognised("/nonsense"));
+        assert_sendable("unrecognised/text", &unrecognised("hello"));
+        assert_sendable("confirmed", &confirmed(&txid(4).to_string(), 6));
+        assert_sendable(
+            "incoming",
+            &incoming(Amount::from_sat(1), TxStatus::Unconfirmed),
+        );
+        assert_sendable("session_expired", &session_expired());
+        assert_sendable("backend_degraded", &backend_degraded());
+        assert_sendable("backend_recovered", &backend_recovered());
+    }
+
+    /// Every `CoreError` renders into something sendable, including the
+    /// variants that carry text straight from a node.
+    #[test]
+    fn every_error_message_is_valid_telegram_html() {
+        use wallet_core::{BackendError, CoreError};
+
+        let errors = [
+            CoreError::NoWallet,
+            CoreError::WalletExists,
+            CoreError::InvalidMnemonic,
+            CoreError::BackupCheckFailed,
+            CoreError::InvalidPin { min: 6, max: 8 },
+            CoreError::WrongPin { remaining: 2 },
+            CoreError::Locked,
+            CoreError::QuoteExpired,
+            // The dangerous one: a node's own words, which can contain anything.
+            CoreError::BroadcastRejected {
+                reason: "bad-txns-inputs-missingorspent <script>".into(),
+            },
+            CoreError::Backend(BackendError::Rpc {
+                code: -26,
+                message: "min relay fee not met <b>".into(),
+            }),
+            CoreError::Payjoin("directory said <no>".into()),
+            CoreError::Storage("attempt to write a readonly database".into()),
+        ];
+
+        for e in &errors {
+            assert_sendable("render_error", &render_error(e));
+            assert_sendable("payjoin_unavailable", &payjoin_unavailable(e));
+        }
+    }
+
+    /// The txid has to be usable, not just pretty: a shortened one cannot be
+    /// pasted into /tx or /bumpfee, which is the whole reason it is shown.
+    #[test]
+    fn a_broadcast_gives_back_the_whole_txid() {
+        let id = txid(7);
+        let full = id.to_string();
+        let card = broadcast_done(
+            Network::Regtest,
+            &Broadcast {
+                txid: id,
+                amount: Amount::from_sat(50_000),
+                fee: Amount::from_sat(410),
+                payjoin: false,
+            },
+        );
+
+        assert!(card.contains(&full), "the whole txid must be present");
+        assert!(
+            card.contains(&format!("/tx {full}")),
+            "and offered to /tx, ready to copy"
+        );
+        assert!(
+            card.contains(&format!("/bumpfee {full}")),
+            "and to /bumpfee, which is the other thing you need it for"
+        );
+
+        // A confirmation notification too.
+        assert!(confirmed(&full, 6).contains(&full));
+    }
+
+    /// /network has to actually name the network.
+    #[test]
+    fn the_network_card_names_the_chain() {
+        assert!(network_card(Network::Bitcoin).contains("MAINNET"));
+        assert!(network_card(Network::Regtest).contains("REGTEST"));
     }
 }
