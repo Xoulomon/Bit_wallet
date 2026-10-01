@@ -24,6 +24,12 @@ fn user_of(msg: &Message, ctx: &Ctx) -> Result<UserId> {
     ctx.users.resolve(from.id.0 as i64)
 }
 
+/// Telegram's "message is not modified" is the one edit failure that means
+/// the screen is already right.
+fn is_unmodified(e: &teloxide::RequestError) -> bool {
+    e.to_string().contains("message is not modified")
+}
+
 /// A history full of mempool.space links would otherwise be a wall of
 /// previews.
 fn no_preview() -> LinkPreviewOptions {
@@ -123,16 +129,26 @@ pub async fn refresh_balance(bot: Bot, query: CallbackQuery, ctx: Ctx) -> Result
 
     match ctx.core.balance(user).await {
         Ok(b) => {
-            bot.edit_message_text(
-                message.chat().id,
-                message.id(),
-                ui::balance(ctx.core.network(), &b),
-            )
-            .parse_mode(ParseMode::Html)
-            .reply_markup(InlineKeyboardMarkup::new([[
-                InlineKeyboardButton::callback("🔄 Refresh", "bal:refresh"),
-            ]]))
-            .await?;
+            let edit = bot
+                .edit_message_text(
+                    message.chat().id,
+                    message.id(),
+                    ui::balance(ctx.core.network(), &b),
+                )
+                .parse_mode(ParseMode::Html)
+                .reply_markup(InlineKeyboardMarkup::new([[
+                    InlineKeyboardButton::callback("🔄 Refresh", "bal:refresh"),
+                ]]))
+                .await;
+
+            // A refresh that changes nothing produces a byte-identical card,
+            // and Telegram rejects that edit. The balance is already correct on
+            // screen, so this is success — not something to log as a failure.
+            if let Err(e) = edit
+                && !is_unmodified(&e)
+            {
+                return Err(e.into());
+            }
         }
         Err(e) => {
             bot.send_message(message.chat().id, ui::render_error(&e))

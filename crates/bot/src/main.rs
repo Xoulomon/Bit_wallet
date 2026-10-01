@@ -147,7 +147,11 @@ fn schema() -> teloxide::dispatching::UpdateHandler<anyhow::Error> {
         .branch(dptree::filter_map(guard).endpoint(refuse))
         .enter_dialogue::<Message, SqliteDialogueStore, State>()
         .branch(commands)
-        .branch(states);
+        .branch(states)
+        // Nothing above matched. Without this the update is dropped and the
+        // user gets silence, which is indistinguishable from a broken bot —
+        // one mistyped command and they have no idea why.
+        .endpoint(unrecognised);
 
     // §8.5: callback data is `action:subject:arg`, and every id in it is one
     // core minted — so a replayed button can only reference something core will
@@ -191,6 +195,15 @@ fn guard(msg: Message, ctx: Ctx) -> Option<auth::Refusal> {
 
 async fn refuse(bot: Bot, msg: Message, refusal: auth::Refusal) -> Result<()> {
     bot.send_message(msg.chat.id, refusal.message()).await?;
+    Ok(())
+}
+
+/// A message no command and no dialogue state claimed.
+async fn unrecognised(bot: Bot, msg: Message) -> Result<()> {
+    let text = msg.text().unwrap_or_default();
+    bot.send_message(msg.chat.id, ui::unrecognised(text))
+        .parse_mode(teloxide::types::ParseMode::Html)
+        .await?;
     Ok(())
 }
 

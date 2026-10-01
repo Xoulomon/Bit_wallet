@@ -47,6 +47,21 @@ pub fn escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Something the bot could not route. Distinguishes a mistyped command from
+/// stray conversation, because the useful reply differs (§8.1: errors are
+/// sentences with a next step).
+pub fn unrecognised(text: &str) -> String {
+    if text.starts_with('/') {
+        let name = text.split_whitespace().next().unwrap_or(text);
+        format!(
+            "I don't know <code>{}</code>. /help lists everything I do.",
+            escape(name)
+        )
+    } else {
+        "I only take commands — /help lists them.".into()
+    }
+}
+
 pub fn welcome(network: Network, has_wallet: bool) -> String {
     let badge = badge(network);
     if has_wallet {
