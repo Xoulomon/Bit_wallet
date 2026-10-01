@@ -69,8 +69,10 @@ cargo run -p wallet-cli -- status
 cargo run -p wallet-cli -- create
 ```
 
-[`docs/polar-setup.md`](docs/polar-setup.md) has the full walkthrough, and
-[`docs/payjoin-setup.md`](docs/payjoin-setup.md) covers payjoin.
+[`docs/running.md`](docs/running.md) is the full command reference for all
+three crates, [`docs/polar-setup.md`](docs/polar-setup.md) walks through the
+regtest setup, and [`docs/payjoin-setup.md`](docs/payjoin-setup.md) covers
+payjoin.
 
 ---
 
