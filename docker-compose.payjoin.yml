@@ -1,0 +1,47 @@
+# A local payjoin directory and OHTTP relay, for regtest (PLAN.md §7).
+#
+#   docker compose -f docker-compose.payjoin.yml up -d
+#
+# The bot fetches the directory's OHTTP keys through the relay at startup, so
+# both must be running before /pj_receive will work. On mainnet these are
+# replaced by the public https://payjo.in and a public relay, and nothing here
+# runs at all.
+
+services:
+  redis:
+    image: redis:7-alpine
+    # The directory's store. Payjoin sessions are short-lived by design, so
+    # this holds nothing worth persisting across a restart.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  payjoin-directory:
+    image: ghcr.io/payjoin/payjoin-directory:latest
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      PJ_DB_HOST: redis:6379
+      PJ_DIR_PORT: "8080"
+      RUST_LOG: info
+    ports:
+      # REGTEST_PAYJOIN_DIRECTORY
+      - "8080:8080"
+
+  ohttp-relay:
+    image: ghcr.io/payjoin/ohttp-relay:latest
+    depends_on:
+      - payjoin-directory
+    environment:
+      PORT: "3000"
+      # The relay only forwards to this one gateway, which is what keeps a
+      # local setup from becoming an open proxy.
+      GATEWAY_ORIGIN: http://payjoin-directory:8080
+      RUST_LOG: info
+    ports:
+      # REGTEST_OHTTP_RELAY
+      - "3000:3000"

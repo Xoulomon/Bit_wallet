@@ -1,0 +1,36 @@
+graph TD
+    subgraph FE["Front ends — presentation only"]
+        BOT["bot<br/><i>teloxide, qrcode, comfy-table</i><br/>chat → call, data → message"]
+        CLI["wallet-cli<br/><i>~400 lines</i><br/>argv → call, data → stdout"]
+    end
+
+    FACADE["<b>WalletService</b><br/>the only entry point a front end may call"]
+
+    subgraph CORE["wallet-core — the wallet"]
+        KEYS["keys<br/>BIP39 · BIP84 descriptors"]
+        CRYPTO["crypto · storage<br/>Argon2id vault · lockout"]
+        SESSION["session<br/>unlocked seed · idle timer"]
+        ONCHAIN["onchain<br/>wallet · sync · quotes · payment"]
+        PJ["payjoin<br/>v2 receive · v2/v1 send · persist"]
+        RPC["rpc<br/>ChainSource · fees · retry · budget"]
+    end
+
+    subgraph BACKENDS["Chain sources"]
+        POLAR["Polar bitcoind<br/><i>regtest</i><br/>full RPC"]
+        BITRPC["BitRPC<br/><i>mainnet</i><br/>allowlisted, 100 req/min"]
+    end
+
+    BOT --> FACADE
+    CLI --> FACADE
+    FACADE --> KEYS
+    FACADE --> CRYPTO
+    FACADE --> SESSION
+    FACADE --> ONCHAIN
+    FACADE --> PJ
+    ONCHAIN --> RPC
+    PJ --> RPC
+    RPC --> POLAR
+    RPC --> BITRPC
+
+    FACADE -.->|CoreEvent broadcast| BOT
+    FACADE -.->|CoreEvent broadcast| CLI

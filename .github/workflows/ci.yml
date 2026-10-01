@@ -1,0 +1,83 @@
+# CI (PLAN.md §10).
+#
+# No BitRPC key and no Telegram token: the integration tests spawn their own
+# bitcoind through corepc-node, so everything here runs on a bare runner.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # rusqlite compiles SQLite in C; rustls means no OpenSSL is needed.
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # The bitcoind the integration tests spawn, cached separately: it is
+      # downloaded once and is large enough to be worth not re-fetching.
+      - name: Cache bitcoind
+        uses: actions/cache@v4
+        with:
+          path: target/bitcoin
+          key: ${{ runner.os }}-bitcoind-v1
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace -- --test-threads=2
+
+  # A separate job, because it is the cheapest possible check of the one
+  # property the whole layering rests on: delete the Telegram front end and the
+  # wallet still builds and passes its tests (PLAN.md §3a, §10).
+  boundary:
+    name: wallet-core stands alone
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config
+
+      - name: Remove the bot crate
+        run: |
+          rm -rf crates/bot
+          sed -i 's|"crates/bot", ||' Cargo.toml
+          cat Cargo.toml
+
+      - name: Build and test without a front end
+        run: |
+          cargo build -p wallet-core
+          cargo test -p wallet-core --lib

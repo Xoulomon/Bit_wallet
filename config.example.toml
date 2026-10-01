@@ -1,0 +1,35 @@
+# Optional non-secret tuning (PLAN.md §3).
+#
+# Everything here also has an environment variable, and the environment wins.
+# This file exists so an operator can keep the tuning in version control while
+# `.env` holds only the two things that must never be committed: the bot token
+# and the API key.
+
+[limits]
+# Optional per-payment cap, in satoshis. Omit for no cap.
+# max_send_sats = 20000
+
+# How long a wallet stays unlocked after a correct PIN.
+session_idle_timeout_secs = 600
+
+[fees]
+# How long a fee estimate is reused before it is fetched again.
+cache_secs = 60
+
+# Used when estimatesmartfee has no data — every fresh regtest chain.
+regtest_fallback_sat_vb = 2
+
+# Hard floor when getmempoolinfo is unavailable on mainnet.
+mainnet_min_sat_vb = 1
+
+[bitrpc]
+# Headroom under BitRPC's hard 100 req/min, shared by every user.
+rate_limit_per_min = 90
+
+# The block emitter's share of that budget, so a sync backlog can never starve
+# an interactive /send.
+sync_budget_per_min = 60
+
+# /restore refuses a birthday deeper than this. At ~30 blocks/min the default
+# is already about 5.6 hours of scanning.
+max_rescan_blocks = 10000
