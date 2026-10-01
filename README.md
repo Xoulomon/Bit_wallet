@@ -56,10 +56,7 @@ cargo build --release
 
 cp .env.example .env                # fill in TELOXIDE_TOKEN and the REGTEST_* block
 
-# 2. The payjoin directory and OHTTP relay (only needed for /pj_receive)
-docker compose -f docker-compose.payjoin.yml up -d
-
-# 3. Run it
+# 2. Run it (payjoin needs no local setup — see docs/payjoin-setup.md)
 cargo run -p bot
 ```
 
@@ -72,7 +69,8 @@ cargo run -p wallet-cli -- status
 cargo run -p wallet-cli -- create
 ```
 
-[`docs/polar-setup.md`](docs/polar-setup.md) has the full walkthrough.
+[`docs/polar-setup.md`](docs/polar-setup.md) has the full walkthrough, and
+[`docs/payjoin-setup.md`](docs/payjoin-setup.md) covers payjoin.
 
 ---
 
@@ -103,8 +101,8 @@ file refuses to load under the wrong chain.
 | `ALLOWED_USER_IDS` | empty | Allowlist; empty means anyone. |
 | `REGTEST_RPC_URL` | `http://127.0.0.1:18443` | Polar's bitcoind. |
 | `REGTEST_RPC_USER` / `REGTEST_RPC_PASS` | — | From Polar's Connect tab. Required on regtest. |
-| `REGTEST_PAYJOIN_DIRECTORY` | `http://localhost:8080` | From `docker-compose.payjoin.yml`. |
-| `REGTEST_OHTTP_RELAY` | `http://localhost:3000` | Likewise. |
+| `REGTEST_PAYJOIN_DIRECTORY` | `https://payjo.in` | Public even on regtest — a local pair cannot work yet, see [`docs/payjoin-setup.md`](docs/payjoin-setup.md). |
+| `REGTEST_OHTTP_RELAY` | `https://pj.benalleng.com` | Must be a *different* operator from the directory; OHTTP depends on it. |
 | `REGTEST_FALLBACK_FEE_SAT_VB` | `2` | Used when `estimatesmartfee` has no data — every fresh regtest chain. |
 | `BITRPC_URL` | `https://bitrpc.thebuidl.xyz` | Mainnet chain source. |
 | `BITRPC_API_KEY` | — | Required on mainnet. Never commit it. |
@@ -114,7 +112,7 @@ file refuses to load under the wrong chain.
 | `MAINNET_MIN_FEE_SAT_VB` | `1` | Hard floor when `getmempoolinfo` is unavailable. |
 | `MAINNET_FEE_API` | `https://mempool.space/api` | BitRPC has no `estimatesmartfee`. |
 | `MAINNET_PAYJOIN_DIRECTORY` | `https://payjo.in` | |
-| `MAINNET_OHTTP_RELAY` | `https://pj.bobspacebind.com` | |
+| `MAINNET_OHTTP_RELAY` | `https://pj.benalleng.com` | Alternatives: `pj.bobspacebkk.com`, `payjoin.achow101.com`. |
 | `MAINNET_I_UNDERSTAND_RISK` | `false` | Must be `true` or the bot refuses to start on mainnet. |
 | `SESSION_IDLE_TIMEOUT_SECS` | `600` | How long a wallet stays unlocked. |
 | `FEE_CACHE_SECS` | `60` | How long a fee estimate is reused. |
@@ -227,6 +225,12 @@ it that way.
 - **BitRPC is a single point of failure and a privacy trade-off:** its operator
   can see every address the bot queries and every transaction it broadcasts.
   Payjoin protects against outside chain analysis, not against the backend.
+- **Payjoin uses a public directory and relay, on both networks.** OHTTP
+  requires those two to be separate operators, and `payjoin-mailroom` 0.1.2
+  offers no way to point its relay half at a local directory — so a fully
+  local pair cannot complete a session, and the directory operator sees
+  session metadata. [`docs/payjoin-setup.md`](docs/payjoin-setup.md) has the
+  diagnosis and the evidence.
 
 ---
 

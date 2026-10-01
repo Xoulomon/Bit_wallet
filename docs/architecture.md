@@ -126,7 +126,7 @@ sequenceDiagram
     actor Receiver
     participant Bot as bot
     participant Core as WalletService
-    participant Dir as Payjoin directory<br/>(via OHTTP relay)
+    participant Dir as Payjoin directory<br/>(via a separate OHTTP relay)
     actor Sender
 
     Receiver->>Bot: /pj_receive 50000
@@ -137,6 +137,7 @@ sequenceDiagram
     Bot-->>Receiver: QR + "what payjoin does"
 
     Note over Core,Dir: a task in core polls; any front end<br/>— or none — sees it through
+    Note right of Dir: relay and directory must be<br/>different operators, or OHTTP<br/>buys nothing (payjoin-setup.md)
 
     Receiver-->>Sender: the BIP21 URI, out of band
     Sender->>Dir: Original PSBT

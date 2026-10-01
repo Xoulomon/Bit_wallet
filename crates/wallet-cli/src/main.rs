@@ -269,6 +269,13 @@ async fn run(
                 .first()
                 .context("usage: wallet-cli pj-receive <sats>")?
                 .parse()?;
+
+            // The receiver contributes an input and signs the proposal, so
+            // this needs the seed. Every CLI command is its own process, so
+            // there is never a session to inherit — the PIN is collected here
+            // rather than widening the facade (§3a fixes its signature).
+            ensure_unlocked(core, user).await?;
+
             let receipt = core.payjoin_receive(user, Amount::from_sat(sats)).await?;
             println!("{}", receipt.bip21);
             println!(
@@ -349,6 +356,21 @@ fn take_user(args: &mut Vec<String>) -> Result<UserId> {
             Ok(fresh)
         }
     }
+}
+
+/// Open a session if one is not already open.
+///
+/// The bot keeps a session across commands because it is one long-lived
+/// process. A CLI cannot, so any command that needs the seed asks for the PIN
+/// first. That is a front-end concern, which is why it lives here and not on
+/// the facade.
+async fn ensure_unlocked(core: &Arc<WalletService>, user: UserId) -> Result<()> {
+    if core.session(user).is_some() {
+        return Ok(());
+    }
+    let pin = read_pin("PIN: ")?;
+    core.unlock(user, &pin).await?;
+    Ok(())
 }
 
 fn page_arg(args: &[String]) -> u32 {

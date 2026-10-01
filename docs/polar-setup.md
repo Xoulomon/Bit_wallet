@@ -80,11 +80,10 @@ Fund that address:
 
 ## 5. Payjoin on regtest
 
-Payjoin needs a directory and an OHTTP relay. Both run locally:
-
-```bash
-docker compose -f docker-compose.payjoin.yml up -d
-```
+Payjoin needs no local setup: the defaults in `.env.example` point at the
+public directory and a public relay, which is the only configuration that
+works today. [`docs/payjoin-setup.md`](payjoin-setup.md) explains why, and it is
+worth reading before changing those two settings.
 
 Then `/pj_receive 50000` on one account and pay the URI from another. Two
 Telegram accounts is the easiest way to see both sides; `wallet-cli` with a

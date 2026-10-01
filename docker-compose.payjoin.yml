@@ -1,47 +1,97 @@
-# A local payjoin directory and OHTTP relay, for regtest (PLAN.md §7).
+# The payjoin directory and OHTTP relay, for regtest (PLAN.md §7).
 #
 #   docker compose -f docker-compose.payjoin.yml up -d
 #
-# The bot fetches the directory's OHTTP keys through the relay at startup, so
-# both must be running before /pj_receive will work. On mainnet these are
-# replaced by the public https://payjo.in and a public relay, and nothing here
-# runs at all.
+# ---------------------------------------------------------------------------
+# THIS CANNOT COMPLETE A PAYJOIN SESSION TODAY, and the reason is upstream, not
+# here. `payjoin-mailroom` 0.1.2 has no configuration for the relay half's
+# gateway: it is hard-wired to https://payjo.in, so the relay below answers a
+# key fetch for the local directory with its *own* keys and the directory then
+# fails to decrypt. Both halves do start correctly and serve their own OHTTP
+# keys, and the same-instance check passes, so this is ready for the release
+# that makes the gateway configurable.
+#
+# Until then regtest payjoin uses the public directory with a live public relay
+# — see docs/payjoin-setup.md, which has the whole diagnosis. Those are the
+# defaults in .env.example and they work.
+#
+# Under Docker Desktop (including on Linux) containers run in a VM, so the host
+# networking below binds the VM's loopback and nothing appears on yours. Use
+# scripts/payjoin-regtest.sh there.
+# ---------------------------------------------------------------------------
+#
+# Two instances of the same image, and that is not redundancy. `payjoin-mailroom`
+# is directory and relay in one binary, but it refuses to serve a request where
+# both halves are itself:
+#
+#     Rejected OHTTP request from same-instance relay
+#     Forbidden: Relay and gateway must be operated by different entities
+#
+# which is OHTTP's whole point — a single operator who is both relay and
+# gateway sees the client's address *and* the decrypted request, so the privacy
+# guarantee evaporates. In production these are different companies. Locally
+# they are two containers with different sentinel tags, which is the minimum
+# that makes the protocol run honestly.
+#
+# Host networking, so `http://localhost:8080` means the same thing to the bot
+# on the host and to the relay container resolving the gateway the URI names.
+# (Linux only — on Docker Desktop, run the two binaries with `cargo install
+# payjoin-mailroom` instead.)
+#
+# Note the plan assumed `payjoin-directory` + `ohttp-relay` + Redis, which is
+# how upstream shipped it then. It has since been combined and renamed, and
+# needs no Redis: the mailroom keeps its own state in a volume.
 
 services:
-  redis:
-    image: redis:7-alpine
-    # The directory's store. Payjoin sessions are short-lived by design, so
-    # this holds nothing worth persisting across a restart.
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
+  # The directory (gateway): where a sender posts the Original PSBT and where
+  # the receiver long-polls for it. This is REGTEST_PAYJOIN_DIRECTORY.
   payjoin-directory:
-    image: ghcr.io/payjoin/payjoin-directory:latest
-    depends_on:
-      redis:
-        condition: service_healthy
+    # Pinned deliberately. Upstream publishes no `latest` tag — its own compose
+    # file references one that does not exist — and a payjoin directory is not
+    # something to let float underneath a wallet.
+    image: payjoin/payjoin-mailroom:payjoin-mailroom-0.1.2
+    network_mode: host
     environment:
-      PJ_DB_HOST: redis:6379
-      PJ_DIR_PORT: "8080"
+      PJ_LISTENER: "127.0.0.1:8080"
+      PJ_STORAGE_DIR: /data
       RUST_LOG: info
-    ports:
-      # REGTEST_PAYJOIN_DIRECTORY
-      - "8080:8080"
+    volumes:
+      # The OHTTP keys live here and must survive a restart: the URI handed to
+      # a sender embeds them, so losing them invalidates every open session.
+      - payjoin-directory-data:/data
+    restart: unless-stopped
+    healthcheck:
+      # The key endpoint is the one the bot actually calls at startup, so it is
+      # the honest thing to check.
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8080/ohttp-keys >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
-  ohttp-relay:
-    image: ghcr.io/payjoin/ohttp-relay:latest
-    depends_on:
-      - payjoin-directory
+  # The relay: forwards OHTTP requests to the gateway above without being able
+  # to read them. A separate instance, so its sentinel tag differs. This is
+  # REGTEST_OHTTP_RELAY.
+  payjoin-relay:
+    image: payjoin/payjoin-mailroom:payjoin-mailroom-0.1.2
+    network_mode: host
     environment:
-      PORT: "3000"
-      # The relay only forwards to this one gateway, which is what keeps a
-      # local setup from becoming an open proxy.
-      GATEWAY_ORIGIN: http://payjoin-directory:8080
+      PJ_LISTENER: "127.0.0.1:8081"
+      PJ_STORAGE_DIR: /data
       RUST_LOG: info
-    ports:
-      # REGTEST_OHTTP_RELAY
-      - "3000:3000"
+    volumes:
+      - payjoin-relay-data:/data
+    depends_on:
+      payjoin-directory:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8081/ohttp-keys >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  payjoin-directory-data:
+  payjoin-relay-data:
