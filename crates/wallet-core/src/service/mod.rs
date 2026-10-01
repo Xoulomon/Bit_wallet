@@ -230,6 +230,12 @@ impl WalletService {
         self.storage
             .insert_wallet(u, &vault, birthday, Some(challenge))?;
 
+        // Build the watch-only wallet file now, while the mnemonic is in hand.
+        // Deferring it to the first read would mean a wallet whose vault exists
+        // but whose descriptors do not — and a front end that does not hold a
+        // session across commands, like `wallet-cli`, could never create it.
+        crate::onchain::OpenWallet::create(&self.cfg.wallet_db(&u), &parsed, self.network())?;
+
         // Open the session straight away: the user has just proved they hold
         // the PIN, and making them type it twice teaches nothing.
         self.sessions.unlock(u, parsed);
@@ -309,6 +315,8 @@ impl WalletService {
         self.storage.insert_wallet(u, &vault, plan.birthday, None)?;
         // A restored wallet needs no backup quiz: the user already has the words.
         self.storage.mark_backup_confirmed(u)?;
+
+        crate::onchain::OpenWallet::create(&self.cfg.wallet_db(&u), &mnemonic, self.network())?;
         self.sessions.unlock(u, mnemonic);
 
         tracing::info!(user = %u, birthday = plan.birthday, depth = plan.depth, "wallet restored");
@@ -381,9 +389,11 @@ impl WalletService {
             return Err(CoreError::NoWallet);
         }
 
-        // The vault exists but the BDK file does not. Building it needs the
-        // descriptors, which need the mnemonic — so this is the one read path
-        // that wants an open session, and only once per wallet.
+        // The vault exists but the BDK file does not. `create_wallet` and
+        // `restore_wallet` both build it eagerly, so reaching here means the
+        // file was deleted underneath us. Recoverable, but only from an
+        // unlocked session, since rebuilding needs the descriptors.
+        tracing::warn!(user = %u, "wallet file missing; rebuilding from the unlocked session");
         self.sessions
             .with_mnemonic(u, |m| crate::onchain::OpenWallet::create(&path, m, network))
             .ok_or(CoreError::Locked)?

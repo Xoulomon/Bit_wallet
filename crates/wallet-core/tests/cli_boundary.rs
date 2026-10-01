@@ -288,3 +288,52 @@ async fn a_wrong_pin_is_counted_and_the_right_one_clears_it() {
 
     core.shutdown().await;
 }
+
+/// A front end that does not hold a session between commands — `wallet-cli`,
+/// where every command is a new process — must still be able to read.
+///
+/// Regression: `create_wallet` used to seal the vault and leave the BDK wallet
+/// file to be built lazily from the in-memory session, so the file was never
+/// created at all for such a front end and every read returned `Locked`. Found
+/// by running the CLI against a live node, which is why it is worth having a
+/// test that does not keep the service alive across the two halves.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_is_readable_by_a_process_that_never_held_the_session() {
+    let (_node, cfg, _dir) = harness();
+    let alice = UserId::new();
+
+    // First "process": create, then drop the service entirely.
+    {
+        let core = WalletService::new(cfg.clone()).await.expect("starts");
+        core.create_wallet(alice, &Pin::new("864213"))
+            .await
+            .expect("creates");
+        core.shutdown().await;
+    }
+
+    // Second "process": a fresh service with no session anywhere.
+    let core = WalletService::new(cfg).await.expect("starts");
+    assert!(
+        core.session(alice).is_none(),
+        "no session survived the restart"
+    );
+
+    // These are watch-only reads and must not need the PIN (§5).
+    let address = core
+        .next_address(alice)
+        .await
+        .expect("an address without a session");
+    assert!(address.address.to_string().starts_with("bcrt1"));
+
+    let balance = core
+        .balance(alice)
+        .await
+        .expect("a balance without a session");
+    assert_eq!(balance.confirmed, Amount::ZERO);
+
+    core.history(alice, Page::new(0))
+        .await
+        .expect("history without a session");
+
+    core.shutdown().await;
+}

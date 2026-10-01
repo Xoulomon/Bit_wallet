@@ -369,8 +369,18 @@ fn prompt(label: &str) -> Result<String> {
 
 /// Read a PIN without echoing it. The same rule as the bot deleting the
 /// message: a secret must not be left on screen (§8.1).
+///
+/// With no terminal attached, read it from stdin instead. That is not a
+/// weakening — there is no screen to leave it on — and it is what lets this
+/// binary be the headless driver §9 asks for: a test or a script can pipe a
+/// PIN in, which `rpassword` alone refuses with `ENXIO`.
 fn read_pin(label: &str) -> Result<Pin> {
-    Ok(Pin::new(rpassword::prompt_password(label)?))
+    use std::io::IsTerminal as _;
+
+    if std::io::stdin().is_terminal() {
+        return Ok(Pin::new(rpassword::prompt_password(label)?));
+    }
+    Ok(Pin::new(prompt(label)?))
 }
 
 fn chain(network: Network) -> &'static str {

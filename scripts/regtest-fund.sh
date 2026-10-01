@@ -19,29 +19,49 @@ URL="${REGTEST_RPC_URL:-http://127.0.0.1:18443}"
 USER="${REGTEST_RPC_USER:-polaruser}"
 PASS="${REGTEST_RPC_PASS:-polarpass}"
 
-rpc() {
-  local method="$1"; shift
-  local params="${1:-[]}"
+# A throwaway wallet on the node, used only to mine and to send us coins. It
+# has nothing to do with the bot's wallets, which are BIP84 descriptors the
+# node never sees.
+FUND_WALLET="regtest-fund"
+
+# Chain-level calls go to the bare endpoint.
+rpc() { call "$URL" "$@"; }
+
+# Wallet-level calls must name the wallet: Polar loads several, and Core then
+# refuses a bare `sendtoaddress` with -19 rather than guessing which to use.
+wrpc() { call "$URL/wallet/$FUND_WALLET" "$@"; }
+
+call() {
+  local endpoint="$1" method="$2"
+  local params="${3:-[]}"
   curl -s --user "$USER:$PASS" -H 'Content-Type: application/json' \
     --data "{\"jsonrpc\":\"1.0\",\"id\":\"fund\",\"method\":\"$method\",\"params\":$params}" \
-    "$URL"
+    "$endpoint"
 }
 
-result() { python3 -c 'import json,sys;print(json.dumps(json.load(sys.stdin)["result"]))'; }
+# Extract the `result` field, or report the node's error rather than printing
+# `null` and carrying on as though the call had worked.
+result() {
+  python3 -c 'import json,sys
+body = json.load(sys.stdin)
+if body.get("error"):
+    sys.exit("rpc error: " + str(body["error"]))
+print(json.dumps(body["result"]))'
+}
 
 # Polar's node may have no loaded wallet; create a throwaway one for mining.
 ensure_wallet() {
-  rpc createwallet '["regtest-fund"]' >/dev/null 2>&1 || true
-  rpc loadwallet '["regtest-fund"]' >/dev/null 2>&1 || true
+  rpc createwallet "[\"$FUND_WALLET\"]" >/dev/null 2>&1 || true
+  rpc loadwallet "[\"$FUND_WALLET\"]" >/dev/null 2>&1 || true
 }
 
 case "${1:-}" in
   mine)
     blocks="${2:-1}"
     ensure_wallet
-    address=$(rpc getnewaddress | result | tr -d '"')
-    rpc generatetoaddress "[$blocks, \"$address\"]" | result \
-      | python3 -c 'import json,sys;print(f"mined {len(json.load(sys.stdin))} block(s)")'
+    address=$(wrpc getnewaddress | result | tr -d '"')
+    wrpc generatetoaddress "[$blocks, \"$address\"]" | result \
+      | python3 -c 'import json,sys; print("mined", len(json.load(sys.stdin)), "block(s)")'
     ;;
 
   pay)
@@ -50,16 +70,18 @@ case "${1:-}" in
     ensure_wallet
     btc=$(python3 -c "print(f'{$sats/100000000:.8f}')")
     echo "sending $sats sats to $address"
-    rpc sendtoaddress "[\"$address\", $btc]" | result
+    wrpc sendtoaddress "[\"$address\", $btc]" | result
     # One block so it confirms; comment this out to test unconfirmed handling.
-    miner=$(rpc getnewaddress | result | tr -d '"')
-    rpc generatetoaddress "[1, \"$miner\"]" >/dev/null
+    miner=$(wrpc getnewaddress | result | tr -d '"')
+    wrpc generatetoaddress "[1, \"$miner\"]" >/dev/null
     echo "confirmed"
     ;;
 
   info)
     rpc getblockchaininfo | result \
-      | python3 -c 'import json,sys;d=json.load(sys.stdin);print(f"chain {d[\"chain\"]}  blocks {d[\"blocks\"]}")'
+      | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+print("chain", d["chain"], " blocks", d["blocks"])'
     ;;
 
   *)
