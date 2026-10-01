@@ -29,7 +29,9 @@ use wallet_core::{
     AppConfig, WalletService,
     bitcoin::{Amount, FeeRate, Network},
     events::CoreEvent,
-    types::{Auth, Page, Pin, SendAmount, SendRequest, TxDirection, TxStatus, UserId},
+    types::{
+        Auth, Page, PayjoinState, Pin, SendAmount, SendRequest, TxDirection, TxStatus, UserId,
+    },
 };
 
 #[tokio::main]
@@ -278,10 +280,57 @@ async fn run(
 
             let receipt = core.payjoin_receive(user, Amount::from_sat(sats)).await?;
             println!("{}", receipt.bip21);
-            println!(
-                "\nSession {}. Run `wallet-cli events` to watch it.",
-                receipt.session_id
-            );
+            println!("\nSession {}", receipt.session_id);
+            println!("Waiting for the sender. Ctrl-C stops waiting; the session stays open.\n");
+
+            // The polling task lives inside core and dies with this process, so
+            // a CLI that returned here could never receive anything at all.
+            // Follow this session's events until it settles.
+            let mut rx = core.subscribe();
+            loop {
+                let event = tokio::select! {
+                    event = rx.recv() => event,
+                    _ = tokio::signal::ctrl_c() => {
+                        println!("Stopped waiting. `pj-sessions` shows where it got to.");
+                        break;
+                    }
+                };
+
+                match event {
+                    Ok(CoreEvent::Payjoin { session, state, .. })
+                        if session == receipt.session_id =>
+                    {
+                        match state {
+                            PayjoinState::Completed { txid } => {
+                                println!("Payjoin complete: {txid}");
+                                break;
+                            }
+                            PayjoinState::FellBack { txid } => {
+                                println!("Sent as a regular transaction: {txid}");
+                                break;
+                            }
+                            PayjoinState::Expired => {
+                                println!("The request expired. Nothing was sent.");
+                                break;
+                            }
+                            PayjoinState::Cancelled => {
+                                println!("Cancelled.");
+                                break;
+                            }
+                            PayjoinState::Failed { reason } => {
+                                println!("Did not complete: {reason}");
+                                println!("Your funds are untouched.");
+                                break;
+                            }
+                            other => println!("  {other:?}"),
+                        }
+                    }
+                    // Another session, or a lagged receiver: neither ends this
+                    // wait. A closed channel does.
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => break,
+                }
+            }
         }
 
         "pj-sessions" => {

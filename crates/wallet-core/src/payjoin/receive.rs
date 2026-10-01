@@ -269,9 +269,14 @@ async fn drive(ctx: &Context) -> Result<PayjoinState> {
                 receiver
                     .finalize_proposal(|psbt| {
                         let mut signed = psbt.clone();
-                        wallet.sign(&mut signed, &mnemonic).map_err(|e| {
-                            ImplementationError::new(std::io::Error::other(e.to_string()))
-                        })?;
+                        // Ours only. The sender's inputs are not ours to
+                        // finalise and we cannot hold their parent
+                        // transactions, so a whole-PSBT signer refuses here.
+                        wallet
+                            .sign_payjoin_partial(&mut signed, &mnemonic)
+                            .map_err(|e| {
+                                ImplementationError::new(std::io::Error::other(e.to_string()))
+                            })?;
                         Ok(signed)
                     })
                     .save(&persister)
@@ -422,7 +427,7 @@ pub async fn post(request: &payjoin::Request) -> Result<Vec<u8>> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
-        .map_err(|e| CoreError::Payjoin(e.to_string()))?;
+        .map_err(|e| CoreError::Payjoin(explain(&e)))?;
 
     let response = client
         .post(request.url.as_str())
@@ -430,13 +435,42 @@ pub async fn post(request: &payjoin::Request) -> Result<Vec<u8>> {
         .body(request.body.clone())
         .send()
         .await
-        .map_err(|e| CoreError::Payjoin(e.to_string()))?;
+        .map_err(|e| CoreError::Payjoin(format!("POST {}: {}", request.url, explain(&e))))?;
 
+    let status = response.status();
     let body = response
         .bytes()
         .await
-        .map_err(|e| CoreError::Payjoin(e.to_string()))?;
+        .map_err(|e| CoreError::Payjoin(explain(&e)))?;
+
+    // A relay or directory that refuses tells us why in the status, and losing
+    // it leaves "the payjoin failed" with nothing behind it.
+    if !status.is_success() {
+        return Err(CoreError::Payjoin(format!(
+            "POST {} returned {}: {}",
+            request.url,
+            status,
+            String::from_utf8_lossy(&body)
+                .chars()
+                .take(200)
+                .collect::<String>()
+        )));
+    }
+
     Ok(body.to_vec())
+}
+
+/// `reqwest`'s own `Display` is "error sending request for url (…)" and hides
+/// the cause, which is the only part worth reading.
+fn explain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        out.push_str(" <- ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
 }
 
 /// The label stored for `/pj_sessions` (§8.2).

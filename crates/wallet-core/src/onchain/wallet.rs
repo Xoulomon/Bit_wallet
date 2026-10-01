@@ -433,6 +433,36 @@ impl OpenWallet {
     /// design here exactly: the persisted wallet stays watch-only and the
     /// signers are owned by this stack frame and nothing else.
     pub fn sign(&self, psbt: &mut Psbt, mnemonic: &Mnemonic) -> Result<()> {
+        self.sign_with(psbt, mnemonic, SignOptions::default())
+    }
+
+    /// Sign a payjoin PSBT, where some inputs are the counterparty's (§7).
+    ///
+    /// `trust_witness_utxo` has to be on here, and it is worth being explicit
+    /// about why rather than leaving a surprising flag in the code. BDK refuses
+    /// by default to sign a segwit input that carries only `witness_utxo`,
+    /// because without the parent transaction it cannot verify the amount it is
+    /// committing to — the lever behind fee-inflation attacks. In a payjoin we
+    /// *cannot* hold the other party's parent transactions: they contributed
+    /// inputs from a wallet we know nothing about.
+    ///
+    /// What makes that acceptable is the typestate we are inside. By the time
+    /// this is called the payjoin crate has run `check_broadcast_suitability`,
+    /// `identify_receiver_outputs`, `commit_outputs` and `apply_fee_range`, so
+    /// our own outputs and the fee range are already verified against values we
+    /// chose. We trust the witness UTXOs of inputs we are not paying for.
+    pub fn sign_payjoin(&self, psbt: &mut Psbt, mnemonic: &Mnemonic) -> Result<()> {
+        self.sign_with(
+            psbt,
+            mnemonic,
+            SignOptions {
+                trust_witness_utxo: true,
+                ..SignOptions::default()
+            },
+        )
+    }
+
+    fn sign_with(&self, psbt: &mut Psbt, mnemonic: &Mnemonic, options: SignOptions) -> Result<()> {
         let secret = keys::private_descriptors(mnemonic, self.network)?;
         let secp = self.wallet.secp_ctx();
 
@@ -449,14 +479,50 @@ impl OpenWallet {
 
         let finalized = self
             .wallet
-            .sign_with_signers(psbt, &[&external, &internal], SignOptions::default())
+            .sign_with_signers(psbt, &[&external, &internal], options)
             .map_err(|e| CoreError::Wallet(e.to_string()))?;
 
+        // A payjoin PSBT is *expected* to come back unfinalised: the other
+        // party's inputs are not ours to complete. Only our own transactions
+        // must be finalised here, and `sign` is the path those take.
         if !finalized {
             return Err(CoreError::Wallet(
                 "the transaction could not be fully signed".into(),
             ));
         }
+        Ok(())
+    }
+
+    /// Sign our inputs in a shared PSBT without requiring the whole thing to
+    /// finalise — the other party still has theirs to add (§7).
+    pub fn sign_payjoin_partial(&self, psbt: &mut Psbt, mnemonic: &Mnemonic) -> Result<()> {
+        let secret = keys::private_descriptors(mnemonic, self.network)?;
+        let secp = self.wallet.secp_ctx();
+
+        let container = |descriptor: &str| -> Result<SignersContainer> {
+            let (parsed, keymap) = descriptor
+                .to_string()
+                .into_wallet_descriptor(secp, self.network.into())
+                .map_err(|e| CoreError::Wallet(e.to_string()))?;
+            Ok(SignersContainer::build(keymap, &parsed, secp))
+        };
+
+        let external = container(&secret.external)?;
+        let internal = container(&secret.internal)?;
+
+        // The return value is "is the whole PSBT final", which for a shared
+        // transaction is not what we are asking, so it is deliberately ignored.
+        self.wallet
+            .sign_with_signers(
+                psbt,
+                &[&external, &internal],
+                SignOptions {
+                    trust_witness_utxo: true,
+                    ..SignOptions::default()
+                },
+            )
+            .map_err(|e| CoreError::Wallet(e.to_string()))?;
+
         Ok(())
     }
 

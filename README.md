@@ -259,9 +259,21 @@ matches what this project assumes:
 BITRPC_API_KEY=... ./scripts/bitrpc-smoke.sh
 ```
 
-**Not yet covered:** the payjoin protocol exchange has no end-to-end test with
-`payjoin-test-utils`. Everything beneath it is unit-tested, but the v2 round
-trip itself has so far only been exercised against the crate's type system.
+The payjoin round trip has its own end-to-end test, which is `#[ignore]`d
+because it needs the public directory:
+
+```bash
+cargo test -p wallet-core --test payjoin_e2e -- --ignored --nocapture
+```
+
+Two wallets complete a real BIP77 v2 payjoin — the receiver contributes an
+input, the final transaction has inputs from both, and the balances move by the
+right amounts — plus the case where nobody is listening and the sender falls
+back to an ordinary payment. §10 asks for `payjoin-test-utils` instead, which
+would keep this off the network; its only published version depends on
+`payjoin` 0.24 while this project uses 1.1, so it cannot be used yet.
+[`docs/payjoin-setup.md`](docs/payjoin-setup.md) explains why a local directory
+is not an option either.
 
 ---
 

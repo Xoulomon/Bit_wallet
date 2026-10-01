@@ -92,7 +92,22 @@ pub async fn attempt(a: Attempt) -> Result<Outcome> {
                 payjoin: true,
             })
         }
-        Ok(None) | Err(_) => {
+        other => {
+            // Why it did not complete is the whole diagnostic value here, and
+            // discarding it leaves a fallback indistinguishable from a bug.
+            match &other {
+                Ok(None) => tracing::info!(
+                    session = %session,
+                    "payjoin did not complete in time; falling back"
+                ),
+                Err(e) => tracing::warn!(
+                    session = %session,
+                    error = %e,
+                    "payjoin failed; falling back"
+                ),
+                Ok(Some(_)) => unreachable!("handled above"),
+            }
+
             // §7: broadcast the Original and say so. The user's payment goes
             // through either way — only the privacy gain is lost.
             let txid = broadcast(&a.cfg, &fallback).await?;
@@ -133,11 +148,14 @@ async fn try_payjoin(a: &Attempt, session: SessionId) -> Result<Option<Psbt>> {
 
     loop {
         if std::time::Instant::now() > deadline {
+            tracing::info!(session = %session, "sender deadline reached with no proposal");
             return Ok(None);
         }
 
         let (state, _history) =
             replay_event_log(&persister).map_err(|e| CoreError::Payjoin(e.to_string()))?;
+
+        tracing::debug!(session = %session, state = ?std::mem::discriminant(&state), "sender state");
 
         match state {
             SendSession::WithReplyKey(sender) => {
@@ -162,7 +180,18 @@ async fn try_payjoin(a: &Attempt, session: SessionId) -> Result<Option<Psbt>> {
                 let (request, response_ctx) = sender
                     .create_poll_request(relay.as_str())
                     .map_err(|e| CoreError::Payjoin(e.to_string()))?;
-                let body = super::receive::post(&request).await?;
+
+                // This is a long poll: the relay holds the connection until the
+                // receiver posts, so a timeout is the ordinary quiet case and
+                // must not end the attempt — only our own deadline does that.
+                let body = match super::receive::post(&request).await {
+                    Ok(body) => body,
+                    Err(e) => {
+                        tracing::debug!(session = %session, error = %e, "poll returned nothing; retrying");
+                        tokio::time::sleep(POLL_INTERVAL).await;
+                        continue;
+                    }
+                };
 
                 use payjoin::persist::OptionalTransitionOutcome;
                 let outcome = sender
@@ -180,7 +209,14 @@ async fn try_payjoin(a: &Attempt, session: SessionId) -> Result<Option<Psbt>> {
 
             // The receiver declined or the session ended: the fallback carries
             // the payment.
-            SendSession::PendingFallback(_) | SendSession::Closed(_) => return Ok(None),
+            SendSession::PendingFallback(_) => {
+                tracing::info!(session = %session, "receiver declined; falling back");
+                return Ok(None);
+            }
+            SendSession::Closed(_) => {
+                tracing::info!(session = %session, "sender session closed without a proposal");
+                return Ok(None);
+            }
         }
     }
 }
@@ -214,8 +250,11 @@ async fn v1_exchange(a: &Attempt, uri: &PjUri) -> Result<Option<Psbt>> {
 async fn finish(a: &Attempt, proposal: Psbt) -> Result<Txid> {
     let wallet = OpenWallet::load(&a.cfg.wallet_db(&a.user), a.cfg.network.network())?;
 
+    // The proposal carries the receiver's contributed input as well as ours,
+    // so this signs ours and trusts the witness UTXO of theirs — see
+    // `sign_payjoin_partial` for why that is sound inside the typestate.
     let mut signed = proposal;
-    wallet.sign(&mut signed, &a.mnemonic)?;
+    wallet.sign_payjoin_partial(&mut signed, &a.mnemonic)?;
 
     let tx = signed
         .extract_tx()

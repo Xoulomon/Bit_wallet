@@ -93,6 +93,24 @@ curl -s -H 'Accept: application/ohttp-keys' \
   https://payjo.in/.well-known/ohttp-gateway | sha256sum
 ```
 
+## Proving it works
+
+The round trip has a test. It is `#[ignore]`d because it reaches the public
+directory, so it is opt-in rather than part of `cargo test`:
+
+```bash
+cargo test -p wallet-core --test payjoin_e2e -- --ignored --nocapture
+```
+
+It runs both sides in one process against a real directory and relay: the
+receiver opens a session and polls, the sender posts the Original PSBT, the
+receiver walks the §7 checks and contributes an input, the sender signs the
+proposal and broadcasts it. It then asserts the transaction has inputs from
+both wallets — which is the whole privacy claim — and that the balances moved
+by the right amounts. A second test covers the case §7 cares about just as
+much: with nobody listening, the sender falls back to an ordinary payment and
+reports it as a fallback rather than a failure.
+
 ## Privacy, stated plainly
 
 Payjoin breaks the common-input-ownership heuristic for anyone analysing the
