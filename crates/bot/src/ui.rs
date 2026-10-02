@@ -182,6 +182,21 @@ pub fn render_error(e: &CoreError) -> String {
                 "{} is over this bot's per-payment cap of {}.",
                 sats(*amount), sats(*cap)
             ),
+        CoreError::CannotBumpFee { reason } => {
+            use wallet_core::error::FeeBumpRefusal;
+            match reason {
+                FeeBumpRefusal::AlreadyConfirmed =>
+                    "That transaction is already in a block, so its fee can't be changed — \
+                     and it doesn't need to be. /tx shows how many confirmations it has."
+                        .into(),
+                FeeBumpRefusal::NotFound =>
+                    "I don't know that transaction. /history lists the ones this wallet has, \
+                     and the txid has to be the whole thing.".into(),
+                FeeBumpRefusal::NotReplaceable =>
+                    "That transaction didn't signal replace-by-fee, so no node would accept a \
+                     replacement. You'll have to wait for it to confirm.".into(),
+            }
+        }
         CoreError::QuoteExpired =>
             "That payment card has expired, so the fee it quoted may be stale. Start /send again.".into(),
         CoreError::BroadcastRejected { reason } =>

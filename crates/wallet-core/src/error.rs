@@ -95,6 +95,10 @@ pub enum CoreError {
     #[error("this quote is no longer valid")]
     QuoteExpired,
 
+    /// `/bumpfee` cannot apply here, for a reason the user can act on (§6).
+    #[error("cannot bump this fee: {reason}")]
+    CannotBumpFee { reason: FeeBumpRefusal },
+
     /// The node refused the transaction; `reason` is its own words (§6 step 5).
     #[error("broadcast rejected: {reason}")]
     BroadcastRejected { reason: String },
@@ -125,6 +129,32 @@ pub enum CoreError {
     /// Cryptographic failure in the vault (§5) — never carries key material.
     #[error("vault: {0}")]
     Crypto(&'static str),
+}
+
+/// Why a fee bump is impossible.
+///
+/// These are ordinary outcomes, not faults: a confirmed transaction simply
+/// cannot be replaced. Lumping them under a generic wallet error told the user
+/// "something went wrong on this server", which is both wrong and unactionable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeeBumpRefusal {
+    /// Already in a block. Replace-by-fee only works before that.
+    AlreadyConfirmed,
+    /// This wallet has never seen that transaction.
+    NotFound,
+    /// Its inputs did not signal replaceability, so no node will accept a
+    /// replacement.
+    NotReplaceable,
+}
+
+impl std::fmt::Display for FeeBumpRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            FeeBumpRefusal::AlreadyConfirmed => "already confirmed",
+            FeeBumpRefusal::NotFound => "not found in this wallet",
+            FeeBumpRefusal::NotReplaceable => "does not signal replace-by-fee",
+        })
+    }
 }
 
 /// Chain-source failures, kept separate so the bot can retry only where retrying

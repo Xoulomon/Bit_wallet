@@ -159,7 +159,23 @@ async fn drive(ctx: &Context) -> Result<PayjoinState> {
                     .create_poll_request(relay.as_str())
                     .map_err(|e| CoreError::Payjoin(e.to_string()))?;
 
-                let body = post(&request).await?;
+                // A long poll: the relay holds the connection open until the
+                // sender posts, so a timeout is the ordinary quiet case and
+                // must not end the session. Only the expiry above does that —
+                // without this a receiver died on its first silent minute, so
+                // a payjoin only ever worked if the sender was already waiting.
+                let body = match post(&request).await {
+                    Ok(body) => body,
+                    Err(e) => {
+                        tracing::debug!(
+                            session = %ctx.session,
+                            error = %e,
+                            "nothing posted yet; polling again"
+                        );
+                        tokio::time::sleep(POLL_INTERVAL).await;
+                        continue;
+                    }
+                };
 
                 let outcome = receiver
                     .process_response(&body, response_ctx)
@@ -287,7 +303,21 @@ async fn drive(ctx: &Context) -> Result<PayjoinState> {
                 let (request, response_ctx) = receiver
                     .create_post_request(relay.as_str())
                     .map_err(|e| CoreError::Payjoin(e.to_string()))?;
-                let body = post(&request).await?;
+
+                // Worth retrying rather than abandoning a proposal we have
+                // already signed: the sender is waiting for exactly this.
+                let body = match post(&request).await {
+                    Ok(body) => body,
+                    Err(e) => {
+                        tracing::debug!(
+                            session = %ctx.session,
+                            error = %e,
+                            "could not post the proposal; retrying"
+                        );
+                        tokio::time::sleep(POLL_INTERVAL).await;
+                        continue;
+                    }
+                };
 
                 receiver
                     .process_response(&body, response_ctx)

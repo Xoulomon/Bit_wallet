@@ -400,3 +400,116 @@ async fn mining_to_a_given_address_credits_that_wallet() {
 
     core.shutdown().await;
 }
+
+/// `/bumpfee` on a confirmed transaction is an ordinary outcome, not a fault.
+///
+/// Regression: it came back as a generic wallet error, which the bot rendered
+/// as "Something went wrong on this server" — wrong, and leaving the user with
+/// nothing to do about it. Mining a block between the send and the bump is
+/// exactly how a user meets this.
+#[tokio::test(flavor = "multi_thread")]
+async fn bumping_a_confirmed_transaction_says_so() {
+    use wallet_core::error::FeeBumpRefusal;
+
+    let (node, cfg, _dir) = harness();
+    let core = WalletService::new(cfg).await.expect("service starts");
+    let alice = UserId::new();
+    let bob = UserId::new();
+    let pin = Pin::new("864213");
+
+    core.create_wallet(alice, &pin).await.expect("creates");
+    core.create_wallet(bob, &pin).await.expect("creates");
+
+    let address = core.next_address(alice).await.expect("address").address;
+    let miner = node.client.new_address().expect("node address");
+    node.client.generate_to_address(101, &miner).expect("mines");
+    node.client
+        .send_to_address(&address, Amount::from_sat(300_000))
+        .expect("funds");
+    node.client
+        .generate_to_address(1, &miner)
+        .expect("confirms");
+    core.sync_now(alice).await.expect("syncs");
+
+    let destination = core.next_address(bob).await.expect("address").address;
+    let quote = core
+        .quote_send(
+            alice,
+            SendRequest {
+                target: core
+                    .parse_payment(&destination.to_string())
+                    .expect("parses"),
+                raw: destination.to_string(),
+                amount: SendAmount::Exact(Amount::from_sat(50_000)),
+                fee_rate: FeeRate::from_sat_per_vb(1).expect("valid"),
+            },
+        )
+        .await
+        .expect("quotes");
+
+    let sent = core
+        .confirm_send(alice, quote.id, Auth::Session)
+        .await
+        .expect("broadcasts");
+
+    // While it is unconfirmed, a bump is possible — BDK enables RBF by default.
+    core.bump_fee(
+        alice,
+        sent.txid,
+        FeeRate::from_sat_per_vb(5).expect("valid"),
+    )
+    .await
+    .expect("an unconfirmed, replaceable transaction can be bumped");
+
+    // Now mine it, which is what the user did.
+    node.client
+        .generate_to_address(1, &miner)
+        .expect("confirms");
+    core.sync_now(alice).await.expect("syncs");
+
+    match core
+        .bump_fee(
+            alice,
+            sent.txid,
+            FeeRate::from_sat_per_vb(10).expect("valid"),
+        )
+        .await
+    {
+        Err(wallet_core::CoreError::CannotBumpFee {
+            reason: FeeBumpRefusal::AlreadyConfirmed,
+        }) => {}
+        other => panic!("expected AlreadyConfirmed, got {other:?}"),
+    }
+
+    core.shutdown().await;
+}
+
+/// A txid this wallet has never seen is its own answer, not a server fault.
+#[tokio::test(flavor = "multi_thread")]
+async fn bumping_an_unknown_transaction_says_so() {
+    use bdk_wallet::bitcoin::Txid;
+    use wallet_core::error::FeeBumpRefusal;
+
+    let (_node, cfg, _dir) = harness();
+    let core = WalletService::new(cfg).await.expect("service starts");
+    let alice = UserId::new();
+    core.create_wallet(alice, &Pin::new("864213"))
+        .await
+        .expect("creates");
+
+    let stranger = Txid::from_raw_hash(bdk_wallet::bitcoin::hashes::Hash::from_byte_array(
+        [9u8; 32],
+    ));
+
+    match core
+        .bump_fee(alice, stranger, FeeRate::from_sat_per_vb(5).expect("valid"))
+        .await
+    {
+        Err(wallet_core::CoreError::CannotBumpFee {
+            reason: FeeBumpRefusal::NotFound,
+        }) => {}
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+
+    core.shutdown().await;
+}

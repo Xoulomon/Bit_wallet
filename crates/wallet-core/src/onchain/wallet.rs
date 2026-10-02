@@ -394,10 +394,7 @@ impl OpenWallet {
     /// is no fee estimator to get the first attempt right.
     pub fn draft_fee_bump(&mut self, txid: Txid, fee_rate: FeeRate) -> Result<Draft> {
         let psbt = {
-            let mut builder = self
-                .wallet
-                .build_fee_bump(txid)
-                .map_err(|e| CoreError::Wallet(e.to_string()))?;
+            let mut builder = self.wallet.build_fee_bump(txid).map_err(map_bump_error)?;
             builder.fee_rate(fee_rate);
             builder.finish().map_err(map_build_error)?
         };
@@ -537,6 +534,24 @@ impl OpenWallet {
         self.wallet.apply_unconfirmed_txs([(tx, seen)]);
         self.flush()
     }
+}
+
+/// A fee bump that cannot apply is usually an ordinary outcome — the
+/// transaction confirmed while the user was deciding — and deserves to be said
+/// rather than buried in a generic wallet error (§8.1).
+fn map_bump_error(e: bdk_wallet::error::BuildFeeBumpError) -> CoreError {
+    use crate::error::FeeBumpRefusal;
+    use bdk_wallet::error::BuildFeeBumpError as E;
+
+    let reason = match e {
+        E::TransactionConfirmed(_) => FeeBumpRefusal::AlreadyConfirmed,
+        E::TransactionNotFound(_) => FeeBumpRefusal::NotFound,
+        E::IrreplaceableTransaction(_) => FeeBumpRefusal::NotReplaceable,
+        // UnknownUtxo, FeeRateUnavailable and InvalidOutputIndex really are
+        // internal faults, so they keep the generic path.
+        other => return CoreError::Wallet(other.to_string()),
+    };
+    CoreError::CannotBumpFee { reason }
 }
 
 /// Coin selection failures deserve their own variant: "not enough money" is a

@@ -131,9 +131,13 @@ async fn two_wallets_complete_a_v2_payjoin() {
         "the URI offers payjoin"
     );
 
-    // The polling task is already running inside core. Give it a moment to
-    // reach the directory before the sender posts.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait out at least one silent long poll before the sender appears.
+    //
+    // This is the realistic case and it used to break everything: a receiver
+    // whose first poll timed out treated that as fatal and closed the session,
+    // so a payjoin only worked if the sender was already standing there. A
+    // human takes longer than that to scan a QR.
+    tokio::time::sleep(Duration::from_secs(40)).await;
 
     // --- the sender pays it ------------------------------------------------
     let target = core
