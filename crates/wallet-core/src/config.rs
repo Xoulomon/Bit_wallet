@@ -124,6 +124,11 @@ pub struct AppConfig {
     /// Optional safety cap on a single `/send` (§4).
     pub max_send: Option<Amount>,
     pub fee_cache: Duration,
+    /// Where the BTC/USD price comes from. Not network-specific on purpose:
+    /// a regtest balance is shown at the mainnet price, clearly labelled as
+    /// the play money it is, because the alternative is a feature nobody can
+    /// see working without pointing the bot at real coins.
+    pub price_api: String,
 }
 
 impl AppConfig {
@@ -199,6 +204,7 @@ impl AppConfig {
                 _ => None,
             },
             fee_cache: Duration::from_secs(num::<u64>(src, "FEE_CACHE_SECS", 60)?),
+            price_api: opt(src, "PRICE_API").unwrap_or_else(|| "https://mempool.space/api".into()),
         })
     }
 

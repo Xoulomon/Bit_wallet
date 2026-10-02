@@ -10,6 +10,7 @@
 pub mod bitrpc;
 pub mod fees;
 pub mod polar;
+pub mod price;
 pub mod retry;
 
 use crate::{

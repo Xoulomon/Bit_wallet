@@ -12,7 +12,7 @@ use std::time::Duration;
 use wallet_core::{
     AppConfig, NetworkChoice, WalletService,
     config::{BackendConfig, RegtestConfig},
-    service::types::{Auth, Page, Pin, SendAmount, SendRequest, UserId},
+    service::types::{Page, Pin, QuoteId, SendAmount, SendRequest, UserId},
 };
 use zeroize::Zeroizing;
 
@@ -38,6 +38,7 @@ fn harness() -> (Node, AppConfig, tempfile::TempDir) {
         session_idle_timeout: Duration::from_secs(600),
         max_send: None,
         fee_cache: Duration::from_secs(60),
+        price_api: "https://mempool.space/api".into(),
     };
 
     (node, cfg, dir)
@@ -121,9 +122,10 @@ async fn a_second_front_end_can_run_the_whole_wallet_through_the_facade() {
     assert!(quote.fee > Amount::ZERO);
     assert!(!quote.is_payjoin);
 
-    // Alice's session is open from create_wallet, so no PIN is needed.
+    // Alice's session is open from create_wallet, and it makes no difference:
+    // signing takes a PIN either way.
     let sent = core
-        .confirm_send(alice, quote.id, Auth::Session)
+        .confirm_send(alice, quote.id, &pin)
         .await
         .expect("broadcasts");
     assert_eq!(sent.amount, Amount::from_sat(100_000));
@@ -180,18 +182,16 @@ async fn a_quote_cannot_be_confirmed_by_anyone_but_its_owner() {
         .await
         .expect("quotes");
 
-    // Mallory has the id — from a leaked callback, say — and it is useless.
+    // Mallory has the id — from a leaked callback, say — and a PIN that is
+    // correct for his own wallet, and it is still useless: the quote is
+    // Alice's, and ownership is checked before the PIN ever is.
     assert!(matches!(
-        core.confirm_send(mallory, quote.id, Auth::Session).await,
+        core.confirm_send(mallory, quote.id, &pin).await,
         Err(wallet_core::CoreError::QuoteExpired)
     ));
 
     // And Alice's quote survived the attempt.
-    assert!(
-        core.confirm_send(alice, quote.id, Auth::Session)
-            .await
-            .is_ok()
-    );
+    assert!(core.confirm_send(alice, quote.id, &pin).await.is_ok());
 
     core.shutdown().await;
 }
@@ -213,9 +213,10 @@ async fn mining_is_available_on_regtest() {
     core.shutdown().await;
 }
 
-/// §5: a locked wallet cannot sign, and the PIN is what opens it.
+/// §5: the open session is not a bearer token. Signing takes a PIN that was
+/// just typed, and a wrong one leaves the quote where it was.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_locked_wallet_refuses_to_spend_until_the_pin_arrives() {
+async fn an_open_session_does_not_sign_without_a_pin() {
     let (node, cfg, _dir) = harness();
     let core = WalletService::new(cfg).await.expect("service starts");
     let alice = UserId::new();
@@ -247,14 +248,99 @@ async fn a_locked_wallet_refuses_to_spend_until_the_pin_arrives() {
         .await
         .expect("quotes");
 
-    // Quoting needs no PIN — it is watch-only work. Signing does.
+    // Quoting needs no PIN — it is watch-only work. Signing does, and an open
+    // session does not substitute for one: the session Alice still holds from
+    // `create_wallet` buys her nothing here.
+    assert!(core.session(alice).is_some(), "the session is open");
+
+    match core
+        .confirm_send(alice, quote.id, &Pin::new("000000"))
+        .await
+    {
+        Err(wallet_core::CoreError::WrongPin { .. }) => {}
+        other => panic!("an open session must not sign without a PIN, got {other:?}"),
+    }
+
+    // The quote outlived the mistake, so this is a retry and not a fresh
+    // `/send`. If anyone moves `take` above `unlock` in `confirm_send`, this
+    // is the assertion that fails.
+    core.confirm_send(alice, quote.id, &pin)
+        .await
+        .expect("the right PIN signs the quote that survived the wrong one");
+
+    core.shutdown().await;
+}
+
+/// §5: locking changes nothing about what signing costs. The PIN that opens
+/// the wallet is the same PIN that authorises the signature, in one call.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_locked_wallet_signs_when_the_pin_arrives() {
+    let (node, cfg, _dir) = harness();
+    let core = WalletService::new(cfg).await.expect("service starts");
+    let alice = UserId::new();
+    let pin = Pin::new("864213");
+
+    core.create_wallet(alice, &pin).await.expect("creates");
+    let address = core.next_address(alice).await.expect("address").address;
+
+    let miner = node.client.new_address().expect("node address");
+    node.client.generate_to_address(101, &miner).expect("mines");
+    node.client
+        .send_to_address(&address, Amount::from_sat(300_000))
+        .expect("funds");
+    node.client
+        .generate_to_address(1, &miner)
+        .expect("confirms");
+    core.sync_now(alice).await.expect("syncs");
+
+    let quote = core
+        .quote_send(
+            alice,
+            SendRequest {
+                target: core.parse_payment(&address.to_string()).expect("parses"),
+                raw: address.to_string(),
+                amount: SendAmount::Exact(Amount::from_sat(50_000)),
+                fee_rate: FeeRate::from_sat_per_vb(2).expect("valid"),
+            },
+        )
+        .await
+        .expect("quotes");
+
     core.lock(alice);
     assert!(core.session(alice).is_none());
 
+    core.confirm_send(alice, quote.id, &pin)
+        .await
+        .expect("the PIN unlocks and signs in one call");
+
+    core.shutdown().await;
+}
+
+/// An expired card is reported as expired *before* the PIN is checked, so a
+/// user tapping a dead button does not spend one of their five attempts on it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_quote_costs_no_pin_attempt() {
+    let (_node, cfg, _dir) = harness();
+    let core = WalletService::new(cfg).await.expect("service starts");
+    let alice = UserId::new();
+    let pin = Pin::new("864213");
+
+    core.create_wallet(alice, &pin).await.expect("creates");
+
+    // A quote id core has never minted, confirmed with a wrong PIN. The quote
+    // is what is wrong, and that is what it must say.
+    let stranger = QuoteId::new();
     assert!(matches!(
-        core.confirm_send(alice, quote.id, Auth::Session).await,
-        Err(wallet_core::CoreError::Locked)
+        core.confirm_send(alice, stranger, &Pin::new("000000"))
+            .await,
+        Err(wallet_core::CoreError::QuoteExpired)
     ));
+
+    // The lockout counter is untouched: a genuine miss is still the first.
+    match core.unlock(alice, &Pin::new("000000")).await {
+        Err(wallet_core::CoreError::WrongPin { remaining }) => assert_eq!(remaining, 4),
+        other => panic!("expected a first WrongPin, got {other:?}"),
+    }
 
     core.shutdown().await;
 }
@@ -448,7 +534,7 @@ async fn bumping_a_confirmed_transaction_says_so() {
         .expect("quotes");
 
     let sent = core
-        .confirm_send(alice, quote.id, Auth::Session)
+        .confirm_send(alice, quote.id, &pin)
         .await
         .expect("broadcasts");
 
@@ -509,6 +595,277 @@ async fn bumping_an_unknown_transaction_says_so() {
             reason: FeeBumpRefusal::NotFound,
         }) => {}
         other => panic!("expected NotFound, got {other:?}"),
+    }
+
+    core.shutdown().await;
+}
+
+/// Fund Alice with two confirmed outputs and leave one payment unconfirmed,
+/// which is the state every bump test needs: BDK only pulls *confirmed* UTXOs
+/// into a replacement, and the original must still be in the mempool to be
+/// replaceable at all. Getting this backwards fails as `InsufficientFunds` and
+/// reads like a bump bug.
+async fn a_bumpable_payment(
+    node: &Node,
+    core: &std::sync::Arc<WalletService>,
+    alice: UserId,
+    bob: UserId,
+    pin: &Pin,
+    rate: FeeRate,
+) -> wallet_core::bitcoin::Txid {
+    let address = core.next_address(alice).await.expect("address").address;
+    let miner = node.client.new_address().expect("node address");
+    node.client.generate_to_address(101, &miner).expect("mines");
+
+    for _ in 0..2 {
+        node.client
+            .send_to_address(&address, Amount::from_sat(200_000))
+            .expect("funds");
+    }
+    node.client
+        .generate_to_address(1, &miner)
+        .expect("confirms");
+    core.sync_now(alice).await.expect("syncs");
+
+    let destination = core.next_address(bob).await.expect("address").address;
+    let quote = core
+        .quote_send(
+            alice,
+            SendRequest {
+                target: core
+                    .parse_payment(&destination.to_string())
+                    .expect("parses"),
+                raw: destination.to_string(),
+                amount: SendAmount::Exact(Amount::from_sat(50_000)),
+                fee_rate: rate,
+            },
+        )
+        .await
+        .expect("quotes");
+
+    core.confirm_send(alice, quote.id, pin)
+        .await
+        .expect("broadcasts")
+        .txid
+}
+
+/// **The regression test for `/bumpfee` never working.**
+///
+/// The handler used to pick the fastest preset, which on a regtest chain is
+/// the configured fallback — the same rate the original paid. BDK refuses
+/// that, and the refusal came back as `CoreError::Wallet(String)`, which the
+/// bot rendered as a generic server fault for every single bump.
+///
+/// Asserting the *variant* is the point: `is_err()` passed throughout the
+/// entire time the command was broken.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bump_at_the_original_rate_is_a_typed_refusal() {
+    use wallet_core::error::FeeBumpRefusal;
+
+    let (node, cfg, _dir) = harness();
+    let core = WalletService::new(cfg).await.expect("service starts");
+    let alice = UserId::new();
+    let bob = UserId::new();
+    let pin = Pin::new("864213");
+
+    core.create_wallet(alice, &pin).await.expect("creates");
+    core.create_wallet(bob, &pin).await.expect("creates");
+
+    let rate = FeeRate::from_sat_per_vb(2).expect("valid");
+    let txid = a_bumpable_payment(&node, &core, alice, bob, &pin, rate).await;
+
+    match core.bump_fee(alice, txid, rate).await {
+        Err(wallet_core::CoreError::CannotBumpFee {
+            reason: FeeBumpRefusal::RateTooLow { required },
+        }) => {
+            assert!(
+                required > rate,
+                "the refusal has to name a rate above the one that was refused"
+            );
+        }
+        other => panic!("expected RateTooLow, got {other:?}"),
+    }
+
+    core.shutdown().await;
+}
+
+/// The other half: the minimum core advertises is one a bump actually takes.
+///
+/// This is what lets the fee card offer a button that works, instead of
+/// offering one and finding out afterwards. It also pins the claim that
+/// drafting *at* BDK's `required` succeeds — BDK's check is a strict `<`, and
+/// an off-by-one here would make every button on the card dead.
+#[tokio::test(flavor = "multi_thread")]
+async fn bump_fee_options_reports_a_minimum_the_bump_accepts() {
+    let (node, cfg, _dir) = harness();
+    let core = WalletService::new(cfg).await.expect("service starts");
+    let alice = UserId::new();
+    let bob = UserId::new();
+    let pin = Pin::new("864213");
+
+    core.create_wallet(alice, &pin).await.expect("creates");
+    core.create_wallet(bob, &pin).await.expect("creates");
+
+    let rate = FeeRate::from_sat_per_vb(2).expect("valid");
+    let txid = a_bumpable_payment(&node, &core, alice, bob, &pin, rate).await;
+
+    let options = core
+        .bump_fee_options(alice, txid)
+        .await
+        .expect("a replaceable transaction has bump options");
+
+    assert_eq!(options.replaces, txid);
+    assert!(
+        options.fees.floor > options.current,
+        "the minimum must beat what the original paid: {} vs {}",
+        options.fees.floor,
+        options.current
+    );
+    assert!(
+        options
+            .fees
+            .presets
+            .iter()
+            .all(|(_, r)| *r >= options.fees.floor),
+        "a preset below the minimum is a button the network would refuse"
+    );
+
+    core.bump_fee(alice, txid, options.fees.floor)
+        .await
+        .expect("the advertised minimum is accepted");
+
+    core.shutdown().await;
+}
+
+/// The confirm card for a bump must name the person being paid, not the
+/// change coming back.
+///
+/// `wallet_recipient` took the first output it could turn into an address,
+/// with no `is_mine` filter — and BDK shuffles outputs, so it named the change
+/// address about half the time. Latent until now only because `/bumpfee` died
+/// before any card was drawn. Several amounts, because one run of the buggy
+/// code passes on a coin flip.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bump_quote_names_the_recipient_not_the_change() {
+    let (node, cfg, _dir) = harness();
+    let core = WalletService::new(cfg).await.expect("service starts");
+    let alice = UserId::new();
+    let bob = UserId::new();
+    let pin = Pin::new("864213");
+
+    core.create_wallet(alice, &pin).await.expect("creates");
+    core.create_wallet(bob, &pin).await.expect("creates");
+
+    let rate = FeeRate::from_sat_per_vb(2).expect("valid");
+
+    let address = core.next_address(alice).await.expect("address").address;
+    let miner = node.client.new_address().expect("node address");
+    node.client.generate_to_address(101, &miner).expect("mines");
+    for _ in 0..6 {
+        node.client
+            .send_to_address(&address, Amount::from_sat(200_000))
+            .expect("funds");
+    }
+    node.client
+        .generate_to_address(1, &miner)
+        .expect("confirms");
+    core.sync_now(alice).await.expect("syncs");
+
+    for amount in [40_000u64, 55_000, 70_000] {
+        let destination = core.next_address(bob).await.expect("address").address;
+        let quote = core
+            .quote_send(
+                alice,
+                SendRequest {
+                    target: core
+                        .parse_payment(&destination.to_string())
+                        .expect("parses"),
+                    raw: destination.to_string(),
+                    amount: SendAmount::Exact(Amount::from_sat(amount)),
+                    fee_rate: rate,
+                },
+            )
+            .await
+            .expect("quotes");
+
+        let sent = core
+            .confirm_send(alice, quote.id, &pin)
+            .await
+            .expect("broadcasts");
+
+        let minimum = core
+            .bump_fee_options(alice, sent.txid)
+            .await
+            .expect("bump options")
+            .fees
+            .floor;
+        let bumped = core
+            .bump_fee(alice, sent.txid, minimum)
+            .await
+            .expect("bumps");
+
+        assert_eq!(
+            bumped.recipient, destination,
+            "the card named an output that is not the recipient"
+        );
+        core.cancel_quote(alice, bumped.id).await;
+
+        node.client
+            .generate_to_address(1, &miner)
+            .expect("confirms");
+        core.sync_now(alice).await.expect("syncs");
+    }
+
+    core.shutdown().await;
+}
+
+/// §8.2: `/faucet` funds a wallet from the node's own coins and confirms it,
+/// so what arrives is spendable rather than merely sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_faucet_credits_a_wallet_with_spendable_coins() {
+    let (node, cfg, _dir) = harness();
+    let core = WalletService::new(cfg).await.expect("service starts");
+    let alice = UserId::new();
+    let pin = Pin::new("864213");
+
+    core.create_wallet(alice, &pin).await.expect("creates");
+    let address = core.next_address(alice).await.expect("address").address;
+
+    // The node's own wallet needs mature coins before it can hand any out.
+    let miner = node.client.new_address().expect("node address");
+    node.client.generate_to_address(101, &miner).expect("mines");
+
+    let amount = Amount::from_sat(250_000);
+    core.faucet(&address, amount).await.expect("pays");
+    core.sync_now(alice).await.expect("syncs");
+
+    let balance = core.balance(alice).await.expect("balance");
+    assert_eq!(
+        balance.confirmed, amount,
+        "the faucet mines a block, so what it sends is confirmed and spendable"
+    );
+
+    core.shutdown().await;
+}
+
+/// On a chain where nothing has been mined there is nothing to give away, and
+/// saying so is the difference between a usable message and a stack trace.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_faucet_says_what_it_has() {
+    let (_node, cfg, _dir) = harness();
+    let core = WalletService::new(cfg).await.expect("service starts");
+    let alice = UserId::new();
+    let pin = Pin::new("864213");
+
+    core.create_wallet(alice, &pin).await.expect("creates");
+    let address = core.next_address(alice).await.expect("address").address;
+
+    match core.faucet(&address, Amount::from_sat(250_000)).await {
+        Err(wallet_core::CoreError::InsufficientFunds { needed, available }) => {
+            assert_eq!(needed, Amount::from_sat(250_000));
+            assert_eq!(available, Amount::ZERO, "nothing has been mined");
+        }
+        other => panic!("expected InsufficientFunds, got {other:?}"),
     }
 
     core.shutdown().await;

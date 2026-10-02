@@ -59,6 +59,8 @@ pub enum Command {
     Network,
     #[command(description = "regtest only, admins only: /mine <n>")]
     Mine { blocks: String },
+    #[command(description = "regtest only: fund your wallet, /faucet [sats]")]
+    Faucet { sats: String },
 }
 
 #[cfg(test)]
@@ -95,6 +97,7 @@ mod tests {
             "/status",
             "/network",
             "/mine 1",
+            "/faucet 100000",
         ];
 
         for input in spec {

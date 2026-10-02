@@ -114,14 +114,6 @@ impl std::fmt::Debug for Pin {
     }
 }
 
-/// How a spending call is authorised: an already-open session, or a PIN to open
-/// one now. The bot passes whichever it has and learns nothing either way.
-#[derive(Debug, Clone)]
-pub enum Auth {
-    Session,
-    Pin(Pin),
-}
-
 /// Backend health for `/status` (§8.2).
 #[derive(Debug, Clone)]
 pub struct BackendStatus {
@@ -263,6 +255,42 @@ pub struct PaymentTarget {
     pub output_substitution_disabled: bool,
 }
 
+/// What one bitcoin is worth, and who says so (§6).
+///
+/// A convenience, never an input: nothing in this crate prices a transaction
+/// from it. The front end multiplies and formats — core does not know what a
+/// dollar sign looks like (§3a rule 2).
+///
+/// `source` is here for the same reason `FeeSource` is: a number with no
+/// provenance invites more trust than a third-party quote deserves.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FiatPrice {
+    pub usd_per_btc: f64,
+    pub source: String,
+    pub fetched_at: SystemTime,
+}
+
+impl FiatPrice {
+    /// What `amount` is worth, in whole cents.
+    ///
+    /// Cents rather than a float so the front end formats an integer and
+    /// cannot print `$0.30000000000000004`. Saturating, because a balance
+    /// large enough to overflow a `u64` of cents is not a balance.
+    pub fn cents(&self, amount: Amount) -> u64 {
+        let dollars = amount.to_btc() * self.usd_per_btc;
+        if !dollars.is_finite() || dollars <= 0.0 {
+            return 0;
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let cents = (dollars * 100.0).round();
+        if cents >= u64::MAX as f64 {
+            u64::MAX
+        } else {
+            cents as u64
+        }
+    }
+}
+
 /// Where a fee preset came from, so the front end can say so honestly (§6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeeSource {
@@ -291,6 +319,20 @@ pub struct FeeOptions {
     pub floor: FeeRate,
     pub source: FeeSource,
     pub allows_custom: bool,
+}
+
+/// What a replacement for a stuck transaction may pay (§6).
+///
+/// `fees` is an ordinary [`FeeOptions`] with the replacement minimum already
+/// applied — presets below it removed rather than raised, and `floor` set to
+/// it — so a front end draws it with the code it already has and cannot offer
+/// a rate the network would refuse.
+#[derive(Debug, Clone)]
+pub struct BumpOptions {
+    pub replaces: Txid,
+    /// What the stuck transaction paid.
+    pub current: FeeRate,
+    pub fees: FeeOptions,
 }
 
 /// What the user asked for, before core has priced it.

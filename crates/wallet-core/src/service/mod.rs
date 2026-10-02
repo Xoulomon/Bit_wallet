@@ -40,6 +40,7 @@ pub struct WalletService {
     /// Stops the sync task. Step 7 flushes persisters on the way out.
     shutdown: tokio::sync::watch::Sender<bool>,
     fees: Arc<crate::rpc::fees::FeePolicy>,
+    price: Arc<crate::rpc::price::PriceFeed>,
     /// Drafted payments awaiting a human (§3a rule 4).
     quotes: crate::onchain::quotes::Quotes,
     payjoin: Arc<crate::payjoin::persist::SessionStore>,
@@ -84,13 +85,39 @@ fn node_address(cfg: &AppConfig, client: &bitcoincore_rpc::Client) -> Result<Add
 
 /// A fee bump keeps the original recipient; find it among the outputs that are
 /// not ours.
-fn wallet_recipient(draft: &crate::onchain::wallet::Draft, network: Network) -> Result<Address> {
-    draft
+///
+/// The `is_mine` filter is the whole point, and it used to be missing: BDK
+/// shuffles outputs, so taking the first address-shaped one named the *change*
+/// output about half the time. The draft's `amount` and `change` are already
+/// split correctly, so the card would have shown the user's own change address
+/// beside the real recipient's amount — a confirm card for a spend, saying the
+/// wrong thing about where the money goes.
+///
+/// A self-send has no "not ours" to find. Falling back to the largest output
+/// is still honest there, and is better than refusing a bump that is otherwise
+/// perfectly valid.
+fn wallet_recipient(
+    draft: &crate::onchain::wallet::Draft,
+    wallet: &crate::onchain::OpenWallet,
+    network: Network,
+) -> Result<Address> {
+    let addressed: Vec<_> = draft
         .psbt
         .unsigned_tx
         .output
         .iter()
-        .find_map(|o| Address::from_script(&o.script_pubkey, network).ok())
+        .filter_map(|o| {
+            Address::from_script(&o.script_pubkey, network)
+                .ok()
+                .map(|a| (a, o.value))
+        })
+        .collect();
+
+    addressed
+        .iter()
+        .find(|(address, _)| !wallet.is_mine(address))
+        .or_else(|| addressed.iter().max_by_key(|(_, value)| *value))
+        .map(|(address, _)| address.clone())
         .ok_or_else(|| CoreError::Wallet("the replacement has no recognisable output".into()))
 }
 
@@ -138,6 +165,7 @@ impl WalletService {
         let sessions = Sessions::new(cfg.session_idle_timeout, events.clone());
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let cfg_for_fees = cfg.clone();
+        let price_api = cfg.price_api.clone();
         let payjoin_db = cfg.network_dir().join("payjoin.sqlite");
 
         // One follower for every wallet: a block is fetched once, however many
@@ -154,6 +182,7 @@ impl WalletService {
             chain,
             events,
             fees: Arc::new(crate::rpc::fees::FeePolicy::new(&cfg_for_fees)),
+            price: Arc::new(crate::rpc::price::PriceFeed::new(&price_api)),
             storage,
             sessions,
             shutdown: shutdown_tx,
@@ -554,6 +583,24 @@ impl WalletService {
             .map_err(|e| CoreError::Wallet(e.to_string()))?
     }
 
+    /// What a bitcoin is worth right now, or `None` if nobody could say (§6).
+    ///
+    /// Deliberately not a `Result`: a price is decoration on a card, and a
+    /// `/balance` that failed because a price API was unreachable would be a
+    /// worse bug than the missing line. Cached for five minutes, and a failure
+    /// is remembered for a minute so an offline bot does not pay the HTTP
+    /// timeout on every command.
+    ///
+    /// Available on regtest too, where it is the mainnet price applied to
+    /// coins that are worth nothing. The front end is responsible for saying
+    /// so — core does not editorialise (§3a rule 2).
+    pub async fn price(&self) -> Option<FiatPrice> {
+        let price = Arc::clone(&self.price);
+        tokio::task::spawn_blocking(move || price.get())
+            .await
+            .unwrap_or(None)
+    }
+
     /// MVP 8, first half. Builds and prices a PSBT that stays inside core; the
     /// caller gets plain numbers and an id (§3a rule 4).
     pub async fn quote_send(&self, u: UserId, req: SendRequest) -> Result<SendQuote> {
@@ -617,13 +664,29 @@ impl WalletService {
     /// MVP 8 + 9, second half. Signs the quoted PSBT and broadcasts it.
     ///
     /// The quote is re-validated here — expiry and ownership are checked by the
-    /// store — so a replayed button cannot move money (§8.5). A `Pin` opens a
-    /// session first, which is why a user who unlocked a minute ago is not
-    /// asked again.
-    pub async fn confirm_send(&self, u: UserId, q: QuoteId, auth: Auth) -> Result<Broadcast> {
-        if let Auth::Pin(pin) = &auth {
-            self.unlock(u, pin).await?;
-        }
+    /// store — so a replayed button cannot move money (§8.5).
+    ///
+    /// **A PIN is required, always.** It used to be enough to have unlocked in
+    /// the last ten minutes, which made the open session a bearer token for
+    /// every signature inside it. Taking a `&Pin` rather than an `Auth` makes
+    /// that structural: there is no longer a value a front end could pass to
+    /// sign without one. A session still exists, and still authorises reading
+    /// and drafting — it just cannot authorise a signature.
+    ///
+    /// **The order of the next three statements is load-bearing**, and
+    /// `a_wrong_pin_leaves_the_quote_takeable` is what keeps it that way:
+    ///
+    /// 1. `peek` — an expired card is reported as expired, before the PIN is
+    ///    checked, so a dead card never costs an attempt against the lockout;
+    /// 2. `unlock` — a wrong PIN returns here, with the quote still parked, so
+    ///    the user retries instead of starting over;
+    /// 3. `take` — only now is the quote consumed, and consumed exactly once.
+    ///
+    /// Moving the cheap check below the expensive Argon2 hash would look like
+    /// an optimisation and would silently destroy a quote on every mistype.
+    pub async fn confirm_send(&self, u: UserId, q: QuoteId, pin: &Pin) -> Result<Broadcast> {
+        self.quotes.peek(u, q)?;
+        self.unlock(u, pin).await?;
 
         let (quote, mut psbt) = self.quotes.take(u, q)?;
 
@@ -689,6 +752,35 @@ impl WalletService {
         self.quotes.cancel(u, q);
     }
 
+    /// What a replacement for `txid` may pay (§6).
+    ///
+    /// The front end needs this *before* it draws a fee card, because the
+    /// usual presets are the wrong menu for a bump: a replacement must beat
+    /// the original, and on a chain whose single preset is the rate the
+    /// original already paid, every button on the ordinary card would be
+    /// refused. This returns a `FeeOptions` with that minimum already applied,
+    /// so the front end draws it with the code it already has.
+    ///
+    /// Presets below the minimum are **dropped, not raised**. Raising them
+    /// would turn Slow, Normal and Fast into three buttons with one rate,
+    /// which is a lie about what the labels mean.
+    pub async fn bump_fee_options(&self, u: UserId, txid: Txid) -> Result<BumpOptions> {
+        let mut wallet = self.open_wallet(u)?;
+        let (current, bdk_minimum) = wallet.bump_minimum(txid)?;
+
+        let mut fees = self.fee_options().await?;
+        let minimum = bdk_minimum.max(fees.floor);
+
+        fees.presets.retain(|(_, rate)| *rate >= minimum);
+        fees.floor = minimum;
+
+        Ok(BumpOptions {
+            replaces: txid,
+            current,
+            fees,
+        })
+    }
+
     /// `/bumpfee` (§6). Returns the same `SendQuote` shape, so the confirm card
     /// is the same code — only the header differs.
     pub async fn bump_fee(&self, u: UserId, txid: Txid, rate: FeeRate) -> Result<SendQuote> {
@@ -701,7 +793,7 @@ impl WalletService {
         let mut wallet = self.open_wallet(u)?;
         let draft = wallet.draft_fee_bump(txid, rate)?;
 
-        let recipient = wallet_recipient(&draft, self.network())?;
+        let recipient = wallet_recipient(&draft, &wallet, self.network())?;
         let quote = SendQuote {
             id: QuoteId::new(),
             recipient,
@@ -873,6 +965,96 @@ impl WalletService {
             client
                 .generate_to_address(u64::from(blocks), &address)
                 .map_err(crate::rpc::map_rpc_error("generatetoaddress"))
+        })
+        .await
+        .map_err(|e| CoreError::Wallet(e.to_string()))?
+    }
+
+    /// `/faucet` (§8.2). Pay `to` from one of the node's own wallets and
+    /// confirm it with a block.
+    ///
+    /// This is the only place core spends coins it does not own, and it is
+    /// confined to regtest for the same reason `/mine` is: a node wallet with
+    /// spendable coins and `generatetoaddress` both exist only there. The
+    /// capability check refuses first, so the refusal reads the same as
+    /// `/mine`'s on any other network.
+    ///
+    /// `InsufficientFunds` here is about the *node's* wallet, not the caller's
+    /// — on a fresh chain nothing has been mined yet and there is nothing to
+    /// hand out. The front end has the context to say so.
+    pub async fn faucet(&self, to: &Address, amount: Amount) -> Result<Txid> {
+        if !self.chain.capabilities().mining {
+            return Err(CoreError::UnsupportedOnNetwork {
+                network: self.network(),
+            });
+        }
+
+        let cfg = self.cfg.clone();
+        let to = to.clone();
+        tokio::task::spawn_blocking(move || -> Result<Txid> {
+            use bitcoincore_rpc::RpcApi as _;
+
+            let regtest = match &cfg.backend {
+                BackendConfig::Regtest(r) => r,
+                BackendConfig::Bitrpc(_) => {
+                    return Err(CoreError::UnsupportedOnNetwork {
+                        network: cfg.network.network(),
+                    });
+                }
+            };
+
+            let source = ChainSource::connect(&cfg)?;
+            let client = source.client();
+
+            // `sendtoaddress` is a *wallet* RPC and Polar loads several, so a
+            // bare call is refused with -19 rather than guessing. Name one —
+            // and name the one that can actually pay, because an empty wallet
+            // is loaded just as often as a funded one.
+            let loaded = client
+                .list_wallets()
+                .map_err(crate::rpc::map_rpc_error("listwallets"))?;
+
+            let mut richest: Option<(bitcoincore_rpc::Client, Amount)> = None;
+            for name in &loaded {
+                let scoped = crate::rpc::polar::wallet_client(regtest, name)?;
+                let balance = scoped
+                    .get_balance(None, None)
+                    .map_err(crate::rpc::map_rpc_error("getbalance"))?;
+                if richest.as_ref().is_none_or(|(_, best)| balance > *best) {
+                    richest = Some((scoped, balance));
+                }
+            }
+
+            // No wallet loaded at all is the same answer as every wallet
+            // empty: there is nothing here to give away.
+            let (wallet, available) = richest.ok_or(CoreError::InsufficientFunds {
+                needed: amount,
+                available: Amount::ZERO,
+            })?;
+            if available < amount {
+                return Err(CoreError::InsufficientFunds {
+                    needed: amount,
+                    available,
+                });
+            }
+
+            let txid = wallet
+                .send_to_address(&to, amount, None, None, None, None, None, None)
+                .map_err(crate::rpc::map_rpc_error("sendtoaddress"))?;
+
+            // One block, so what arrives is spendable rather than merely sent.
+            // Without it the caller sees a pending balance and no way to use
+            // it, which on regtest looks like the faucet failed.
+            let miner = wallet
+                .get_new_address(None, None)
+                .map_err(crate::rpc::map_rpc_error("getnewaddress"))?
+                .require_network(cfg.network.network())
+                .map_err(|e| CoreError::Wallet(e.to_string()))?;
+            client
+                .generate_to_address(1, &miner)
+                .map_err(crate::rpc::map_rpc_error("generatetoaddress"))?;
+
+            Ok(txid)
         })
         .await
         .map_err(|e| CoreError::Wallet(e.to_string()))?

@@ -76,14 +76,32 @@ Private chats only; it refuses in groups before any handler runs.
 | `/receive` | next unused address, QR + BIP21 |
 | `/addresses [page]` `/balance` `/history [page]` `/tx <txid>` | reading |
 | `/send <address\|bip21> [sats\|max]` | fee card → confirm card → PIN |
-| `/bumpfee <txid>` | raise the fee on a stuck transaction |
+| `/bumpfee <txid>` | raise the fee on a stuck transaction — same fee card as `/send` |
 | `/pj_receive <sats>` `/pj_sessions` | payjoin |
 | `/status` `/network` | backend tip, latency, call budget, session |
 | `/mine <n>` | regtest, admins only — mines to *your* wallet |
+| `/faucet [sats]` | regtest — funds your wallet from the node and confirms it |
+
+Signing always costs a PIN, whether or not `/unlock` left a session open. The
+session buys you reading and drafting; it does not buy you a signature. One
+exception, and it is structural rather than an oversight: a payjoin *receive*
+signs later and on its own, when the sender's proposal arrives, so there is no
+moment at which anyone could be asked. What bounds that is
+`SESSION_IDLE_TIMEOUT_SECS`, not a PIN.
+
+`/balance`, the send confirm card, `/tx` and the send receipt carry an
+approximate dollar value, from `PRICE_API` (mempool.space by default) and
+cached for five minutes. On regtest the figure is the real mainnet price
+applied to coins that are worth nothing, and the card says so. If the price
+API cannot be reached the lines are simply absent — no command fails over it,
+and no fee or amount is ever derived from a price.
 
 A freshly mined coinbase needs 100 more blocks before it is spendable, so
-`/mine 101` is the useful number. For coins you can spend immediately, use
-`/receive` and fund that address with the script below.
+`/mine 101` is the useful number — and `/mine` reports one result, not one
+message per block. For coins you can spend immediately, `/faucet` is the short
+way: it pays your next address from the node's own wallet and mines a block so
+the coins are usable at once. It needs the node to have mined first, so on a
+brand-new chain the order is `/mine 101`, then `/faucet`.
 
 ---
 
@@ -124,6 +142,10 @@ there is not — which is what makes it scriptable:
 
 ```bash
 printf '864213\n864213\n' | cargo run -q -p wallet-cli -- create
+
+# `send` asks to confirm and then for the PIN, every time — an open session
+# does not sign.
+printf 'yes\n864213\n' | cargo run -q -p wallet-cli -- send <address> 50000 2
 ```
 
 ---
@@ -152,10 +174,14 @@ BITRPC_API_KEY=... ./scripts/bitrpc-smoke.sh        # check the mainnet allowlis
 # 2. The bot, left running in its own terminal
 cargo run -p bot
 
-# 3. In Telegram: /create, then /receive — copy the address
+# 3. In Telegram: /create — the seed phrase is on screen for 15 seconds
 
-# 4. Fund it with spendable coins
-./scripts/regtest-fund.sh pay <that address> 250000
+# 4. Fund it, without leaving the chat
+#    /mine 101     (admins only, and only needed once per chain)
+#    /faucet 250000
+#
+#    Or from here, which is the same thing and works for any address:
+#    ./scripts/regtest-fund.sh pay <address from /receive> 250000
 
 # 5. Back in Telegram: /balance, /history, /send, /tx <txid>
 ```

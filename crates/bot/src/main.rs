@@ -113,6 +113,7 @@ fn schema() -> teloxide::dispatching::UpdateHandler<anyhow::Error> {
         .branch(case![Command::Send { args }].endpoint(handlers::send::send))
         .branch(case![Command::Bumpfee { txid }].endpoint(handlers::send::bump_fee))
         .branch(case![Command::Mine { blocks }].endpoint(handlers::admin::mine))
+        .branch(case![Command::Faucet { sats }].endpoint(handlers::admin::faucet))
         .branch(case![Command::PjReceive { sats }].endpoint(handlers::payjoin::receive))
         .branch(case![Command::PjSessions].endpoint(handlers::payjoin::sessions))
         .endpoint(handlers::start::not_yet);
@@ -138,10 +139,7 @@ fn schema() -> teloxide::dispatching::UpdateHandler<anyhow::Error> {
         )
         .branch(case![State::AwaitPin { pending }].endpoint(handlers::wallet::receive_pin))
         .branch(case![State::DeleteTypeConfirm].endpoint(handlers::wallet::receive_delete_word))
-        .branch(
-            case![State::AwaitCustomFee { target, amount }]
-                .endpoint(handlers::send::receive_custom_fee),
-        );
+        .branch(case![State::AwaitCustomFee { what }].endpoint(handlers::send::receive_custom_fee));
 
     let messages = Update::filter_message()
         .branch(dptree::filter_map(guard).endpoint(refuse))
@@ -162,10 +160,19 @@ fn schema() -> teloxide::dispatching::UpdateHandler<anyhow::Error> {
                 .endpoint(handlers::onchain::refresh_balance),
         )
         .enter_dialogue::<CallbackQuery, SqliteDialogueStore, State>()
-        .branch(dptree::filter(starts_with("send:fee:")).branch(
-            case![State::AwaitFeeChoice { target, amount }].endpoint(handlers::send::choose_fee),
-        ))
-        .branch(dptree::filter(starts_with("send:confirm:")).endpoint(handlers::send::confirm))
+        .branch(
+            dptree::filter(starts_with("send:fee:"))
+                .branch(case![State::AwaitFeeChoice { what }].endpoint(handlers::send::choose_fee)),
+        )
+        // Gated on the state, not only on the id: `confirm` rewrites the
+        // dialogue to ask for a PIN, so a tap on a card the flow has moved
+        // past must not reach it. The fallback endpoint is what stops a stale
+        // card being answered with silence.
+        .branch(
+            dptree::filter(starts_with("send:confirm:"))
+                .branch(case![State::SendConfirm { quote, card }].endpoint(handlers::send::confirm))
+                .endpoint(handlers::send::confirm_stale),
+        )
         .branch(dptree::filter(starts_with("send:cancel:")).endpoint(handlers::send::cancel))
         .branch(dptree::filter(starts_with("pj:cancel:")).endpoint(handlers::payjoin::cancel));
 

@@ -19,10 +19,13 @@ use crate::{
 use anyhow::Result;
 use std::time::Duration;
 use teloxide::{prelude::*, types::ParseMode};
-use wallet_core::types::{Auth, Pin, UserId};
+use wallet_core::types::{Pin, UserId};
 
-/// §8.1: a mnemonic lives on screen for a minute and then removes itself.
-const MNEMONIC_TTL: Duration = Duration::from_secs(60);
+/// §8.1: a mnemonic lives on screen for a few seconds and then removes itself.
+///
+/// The card itself quotes this number, so the two cannot drift: it is handed to
+/// `ui::mnemonic_card` rather than written out there a second time.
+const MNEMONIC_TTL: Duration = Duration::from_secs(30);
 
 /// Resolve the Telegram id to the opaque `UserId` core understands (§3a rule 3).
 fn user_of(msg: &Message, ctx: &Ctx) -> Result<UserId> {
@@ -227,7 +230,10 @@ pub async fn receive_pin_confirmation(
 
             // Shown once, then removed by us rather than left to the user (§5).
             let shown = bot
-                .send_message(msg.chat.id, ui::mnemonic_card(&new_wallet.mnemonic))
+                .send_message(
+                    msg.chat.id,
+                    ui::mnemonic_card(&new_wallet.mnemonic, MNEMONIC_TTL),
+                )
                 .parse_mode(ParseMode::Html)
                 .await?;
             schedule_deletion(bot.clone(), shown.chat.id, shown.id);
@@ -407,7 +413,7 @@ pub async fn receive_pin(
             Ok(words) => {
                 dialogue.exit().await?;
                 let shown = bot
-                    .send_message(msg.chat.id, ui::mnemonic_card(&words))
+                    .send_message(msg.chat.id, ui::mnemonic_card(&words, MNEMONIC_TTL))
                     .parse_mode(ParseMode::Html)
                     .await?;
                 schedule_deletion(bot.clone(), shown.chat.id, shown.id);
@@ -447,7 +453,8 @@ pub async fn receive_pin(
         PendingAction::Send { quote } => {
             // The PIN opens a session inside `confirm_send`, so the same call
             // both authorises and signs — the bot never learns whether a seed
-            // was decrypted (§3a rule 5).
+            // was decrypted (§3a rule 5). It is also the only way to sign at
+            // all: an open session does not authorise a signature.
             match quote.parse() {
                 Ok(quote) => {
                     return crate::handlers::send::broadcast(
@@ -457,7 +464,7 @@ pub async fn receive_pin(
                         &ctx,
                         user,
                         quote,
-                        Auth::Pin(pin),
+                        &pin,
                     )
                     .await;
                 }
@@ -481,9 +488,7 @@ async fn retry_or_fail(
     dialogue: &WalletDialogue,
     e: &wallet_core::CoreError,
 ) -> Result<()> {
-    if !matches!(e, wallet_core::CoreError::WrongPin { .. }) {
-        dialogue.exit().await?;
-    }
+    crate::handlers::keep_or_exit(dialogue, e).await?;
     bot.send_message(msg.chat.id, ui::render_error(e))
         .parse_mode(ParseMode::Html)
         .await?;
@@ -507,7 +512,7 @@ async fn reply_error(bot: &Bot, msg: &Message, e: &wallet_core::CoreError) -> Re
     Ok(())
 }
 
-/// §8.1: the mnemonic removes itself after a minute, whether or not the user
+/// §8.1: the mnemonic removes itself after `MNEMONIC_TTL`, whether or not the user
 /// acts. Spawned rather than awaited, so the flow continues meanwhile.
 fn schedule_deletion(bot: Bot, chat: teloxide::types::ChatId, message: teloxide::types::MessageId) {
     tokio::spawn(async move {

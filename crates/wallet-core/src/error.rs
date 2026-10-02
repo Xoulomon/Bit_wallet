@@ -145,15 +145,35 @@ pub enum FeeBumpRefusal {
     /// Its inputs did not signal replaceability, so no node will accept a
     /// replacement.
     NotReplaceable,
+
+    /// The rate asked for does not beat the original by enough.
+    ///
+    /// A replacement must pay the original's rate plus the incremental relay
+    /// fee, so on a chain with one flat preset the obvious choice — the same
+    /// rate as last time — is always refused. `required` is the lowest rate
+    /// that will be accepted, and drafting *at* it succeeds.
+    RateTooLow { required: FeeRate },
+
+    /// The replacement's absolute fee does not beat the original's.
+    ///
+    /// Distinct from `RateTooLow`: a replacement can be smaller than what it
+    /// replaces, and then a higher rate still buys a lower total.
+    AbsoluteFeeTooLow { required: Amount },
 }
 
 impl std::fmt::Display for FeeBumpRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            FeeBumpRefusal::AlreadyConfirmed => "already confirmed",
-            FeeBumpRefusal::NotFound => "not found in this wallet",
-            FeeBumpRefusal::NotReplaceable => "does not signal replace-by-fee",
-        })
+        match self {
+            FeeBumpRefusal::AlreadyConfirmed => f.write_str("already confirmed"),
+            FeeBumpRefusal::NotFound => f.write_str("not found in this wallet"),
+            FeeBumpRefusal::NotReplaceable => f.write_str("does not signal replace-by-fee"),
+            FeeBumpRefusal::RateTooLow { required } => {
+                write!(f, "needs at least {} sat/vB", required.to_sat_per_vb_ceil())
+            }
+            FeeBumpRefusal::AbsoluteFeeTooLow { required } => {
+                write!(f, "needs at least {} sat in fees", required.to_sat())
+            }
+        }
     }
 }
 

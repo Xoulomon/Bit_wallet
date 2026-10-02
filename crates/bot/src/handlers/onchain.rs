@@ -97,14 +97,18 @@ fn qr_png(info: &AddressInfo) -> Result<Vec<u8>> {
 
 pub async fn balance(bot: Bot, msg: Message, ctx: Ctx) -> Result<()> {
     let user = user_of(&msg, &ctx)?;
+    let price = ctx.core.price().await;
     match ctx.core.balance(user).await {
         Ok(b) => {
-            bot.send_message(msg.chat.id, ui::balance(ctx.core.network(), &b))
-                .parse_mode(ParseMode::Html)
-                .reply_markup(InlineKeyboardMarkup::new([[
-                    InlineKeyboardButton::callback("🔄 Refresh", "bal:refresh"),
-                ]]))
-                .await?;
+            bot.send_message(
+                msg.chat.id,
+                ui::balance(ctx.core.network(), &b, price.as_ref()),
+            )
+            .parse_mode(ParseMode::Html)
+            .reply_markup(InlineKeyboardMarkup::new([[
+                InlineKeyboardButton::callback("🔄 Refresh", "bal:refresh"),
+            ]]))
+            .await?;
         }
         Err(e) => return crate::handlers::reply_error(&bot, &msg, &e).await,
     }
@@ -127,13 +131,14 @@ pub async fn refresh_balance(bot: Bot, query: CallbackQuery, ctx: Ctx) -> Result
         return Ok(());
     };
 
+    let price = ctx.core.price().await;
     match ctx.core.balance(user).await {
         Ok(b) => {
             let edit = bot
                 .edit_message_text(
                     message.chat().id,
                     message.id(),
-                    ui::balance(ctx.core.network(), &b),
+                    ui::balance(ctx.core.network(), &b, price.as_ref()),
                 )
                 .parse_mode(ParseMode::Html)
                 .reply_markup(InlineKeyboardMarkup::new([[
@@ -198,12 +203,16 @@ pub async fn tx(bot: Bot, msg: Message, ctx: Ctx, txid: String) -> Result<()> {
     };
 
     let user = user_of(&msg, &ctx)?;
+    let price = ctx.core.price().await;
     match ctx.core.tx(user, txid).await {
         Ok(detail) => {
-            bot.send_message(msg.chat.id, ui::tx_detail(ctx.core.network(), &detail))
-                .parse_mode(ParseMode::Html)
-                .link_preview_options(no_preview())
-                .await?;
+            bot.send_message(
+                msg.chat.id,
+                ui::tx_detail(ctx.core.network(), &detail, price.as_ref()),
+            )
+            .parse_mode(ParseMode::Html)
+            .link_preview_options(no_preview())
+            .await?;
         }
         Err(_) => {
             bot.send_message(

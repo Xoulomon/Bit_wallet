@@ -396,7 +396,7 @@ impl OpenWallet {
         let psbt = {
             let mut builder = self.wallet.build_fee_bump(txid).map_err(map_bump_error)?;
             builder.fee_rate(fee_rate);
-            builder.finish().map_err(map_build_error)?
+            builder.finish().map_err(map_bump_build_error)?
         };
 
         let fee = psbt.fee().map_err(|e| CoreError::Wallet(e.to_string()))?;
@@ -421,6 +421,38 @@ impl OpenWallet {
             fee,
             change,
         })
+    }
+
+    /// What the stuck transaction paid, and the lowest rate that may replace
+    /// it — `(current, minimum)`.
+    ///
+    /// Asked of BDK rather than computed. The arithmetic is only
+    /// `previous_rate + incremental_relay_fee`, but it is done in `sat/kwu`
+    /// with its own rounding, and a rate one unit short of legal is a fee card
+    /// whose buttons are all refused. So this drafts a replacement at
+    /// `FeeRate::ZERO` purely to be told `required`: the check happens before
+    /// coin selection, so it costs no RPC and no UTXO work.
+    ///
+    /// If that draft somehow *succeeds*, the original paid nothing, and the
+    /// relay minimum is the only bar left.
+    pub fn bump_minimum(&mut self, txid: Txid) -> Result<(FeeRate, FeeRate)> {
+        let mut builder = self.wallet.build_fee_bump(txid).map_err(map_bump_error)?;
+        builder.fee_rate(FeeRate::ZERO);
+
+        match builder.finish() {
+            Err(bdk_wallet::error::CreateTxError::FeeRateTooLow { required }) => {
+                // BDK's `required` already includes the increment, so what the
+                // original paid is that minus one step.
+                let current = FeeRate::from_sat_per_kwu(
+                    required
+                        .to_sat_per_kwu()
+                        .saturating_sub(FeeRate::BROADCAST_MIN.to_sat_per_kwu()),
+                );
+                Ok((current, required))
+            }
+            Err(other) => Err(map_bump_build_error(other)),
+            Ok(_) => Ok((FeeRate::ZERO, FeeRate::BROADCAST_MIN)),
+        }
     }
 
     /// Sign a drafted PSBT with signers built from the seed (§5, §6 step 5).
@@ -554,8 +586,39 @@ fn map_bump_error(e: bdk_wallet::error::BuildFeeBumpError) -> CoreError {
     CoreError::CannotBumpFee { reason }
 }
 
+/// `map_build_error` for the replacement path.
+///
+/// BDK raises `FeeTooLow` and `FeeRateTooLow` only when `bumping_fee` is set,
+/// which only `build_fee_bump` does — so in principle the shared mapper could
+/// handle them. It is not worth spending an invariant that lives in someone
+/// else's crate on it: the call site says which mapper it means, and the two
+/// bump-only cases are answered here.
+///
+/// This is the difference between "/bumpfee says the server broke" and
+/// "/bumpfee says what rate to use". On a chain whose only preset is the rate
+/// the original already paid — every fresh regtest chain — `FeeRateTooLow` is
+/// not an edge case, it is the default outcome.
+fn map_bump_build_error(e: bdk_wallet::error::CreateTxError) -> CoreError {
+    use crate::error::FeeBumpRefusal;
+    use bdk_wallet::error::CreateTxError as E;
+
+    match e {
+        E::FeeRateTooLow { required } => CoreError::CannotBumpFee {
+            reason: FeeBumpRefusal::RateTooLow { required },
+        },
+        E::FeeTooLow { required } => CoreError::CannotBumpFee {
+            reason: FeeBumpRefusal::AbsoluteFeeTooLow { required },
+        },
+        other => map_build_error(other),
+    }
+}
+
 /// Coin selection failures deserve their own variant: "not enough money" is a
 /// different conversation from "something went wrong" (§8.1).
+///
+/// `FeeTooLow` and `FeeRateTooLow` reaching here would be a genuine fault:
+/// they can only come from a fee bump, and that path uses
+/// [`map_bump_build_error`].
 fn map_build_error(e: bdk_wallet::error::CreateTxError) -> CoreError {
     use bdk_wallet::error::CreateTxError;
     match e {

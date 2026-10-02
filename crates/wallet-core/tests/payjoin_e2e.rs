@@ -25,7 +25,7 @@ use std::time::Duration;
 use wallet_core::{
     AppConfig, NetworkChoice, WalletService,
     config::{BackendConfig, RegtestConfig},
-    service::types::{Auth, Pin, SendAmount, SendRequest, UserId},
+    service::types::{Pin, SendAmount, SendRequest, UserId},
 };
 use zeroize::Zeroizing;
 
@@ -69,6 +69,7 @@ fn harness() -> (Node, AppConfig, tempfile::TempDir) {
         session_idle_timeout: Duration::from_secs(1800),
         max_send: None,
         fee_cache: Duration::from_secs(60),
+        price_api: "https://mempool.space/api".into(),
     };
 
     (node, cfg, dir)
@@ -164,7 +165,7 @@ async fn two_wallets_complete_a_v2_payjoin() {
     assert!(quote.is_payjoin, "the quote must know this is a payjoin");
 
     let broadcast = core
-        .confirm_send(sender, quote.id, Auth::Session)
+        .confirm_send(sender, quote.id, &pin)
         .await
         .expect("the payjoin completes or falls back, but must not error");
 
@@ -274,7 +275,7 @@ async fn an_unanswered_payjoin_falls_back_to_an_ordinary_payment() {
         .expect("quotes");
 
     let broadcast = core
-        .confirm_send(sender, quote.id, Auth::Session)
+        .confirm_send(sender, quote.id, &pin)
         .await
         .expect("a payjoin that cannot complete must still pay");
 

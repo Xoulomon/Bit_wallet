@@ -29,9 +29,7 @@ use wallet_core::{
     AppConfig, WalletService,
     bitcoin::{Amount, FeeRate, Network},
     events::CoreEvent,
-    types::{
-        Auth, Page, PayjoinState, Pin, SendAmount, SendRequest, TxDirection, TxStatus, UserId,
-    },
+    types::{Page, PayjoinState, Pin, SendAmount, SendRequest, TxDirection, TxStatus, UserId},
 };
 
 #[tokio::main]
@@ -254,12 +252,10 @@ async fn run(
                 return Ok(());
             }
 
-            let auth = match core.session(user) {
-                Some(_) => Auth::Session,
-                None => Auth::Pin(read_pin("PIN: ")?),
-            };
+            // Always, even with a session open: signing costs a PIN.
+            let pin = read_pin("PIN: ")?;
 
-            let sent = core.confirm_send(user, quote.id, auth).await?;
+            let sent = core.confirm_send(user, quote.id, &pin).await?;
             println!("\nBroadcast {}", sent.txid);
             if quote.is_payjoin && !sent.payjoin {
                 println!("Payjoin didn't complete; sent as a regular transaction.");
