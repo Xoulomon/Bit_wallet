@@ -312,7 +312,8 @@ pub fn ask_pin() -> String {
 /// know is that no money moved.
 pub fn wrong_pin_retry(remaining: u32) -> String {
     format!(
-        "Wrong PIN — nothing was signed and nothing was sent.\n\n         {remaining} attempt(s) left. Send it again."
+        "Wrong PIN — nothing was signed and nothing was sent.\n\n\
+         {remaining} attempt(s) left. Send it again."
     )
 }
 
@@ -1120,7 +1121,12 @@ fn custom_and_cancel(fees: &FeeOptions) -> Vec<InlineKeyboardButton> {
 /// because without both numbers "at least 3 sat/vB" looks arbitrary.
 pub fn bump_fee_card(network: Network, b: &BumpOptions) -> String {
     let mut out = format!(
-        "{} · <b>Raise the fee</b>\n\n         Replacing <code>{}</code>\n\n         <code>It paid   {} sat/vB</code>\n         <code>Minimum   {} sat/vB</code>\n\n         A replacement has to outbid what it replaces, so anything at or above          the minimum will relay and anything below it will not.",
+        "{} · <b>Raise the fee</b>\n\n\
+         Replacing <code>{}</code>\n\n\
+         <code>It paid   {} sat/vB</code>\n\
+         <code>Minimum   {} sat/vB</code>\n\n\
+         A replacement has to outbid what it replaces, so anything at or \
+         above the minimum will relay and anything below it will not.",
         badge(network),
         escape(&b.replaces.to_string()),
         b.current.to_sat_per_vb_ceil(),
@@ -1129,7 +1135,8 @@ pub fn bump_fee_card(network: Network, b: &BumpOptions) -> String {
 
     if b.fees.presets.is_empty() {
         out.push_str(
-            "\n\nThis chain has no fee estimates above that, so the minimum is the              only rate worth offering — or type your own.",
+            "\n\nThis chain has no fee estimates above that, so the minimum is \
+             the only rate worth offering — or type your own.",
         );
     }
     out
@@ -1981,6 +1988,24 @@ mod html_tests {
                  &lt;{inner}&gt;.\n\nFull text:\n{text}"
             );
             i += 1 + end + 1;
+        }
+
+        // A line that starts with a run of spaces is almost always a `\`
+        // continuation that lost its backslash: the source indentation ends up
+        // inside the string and Telegram renders it. It is invisible in review
+        // and obvious in the chat, which is the worst combination.
+        //
+        // Alignment padding inside the monospace cards is fine — that sits
+        // after a `<code>` tag, never at the start of a line.
+        for (n, line) in text.split('\n').enumerate() {
+            let indent = line.len() - line.trim_start_matches(' ').len();
+            assert!(
+                indent < 3,
+                "{label}: line {} begins with {indent} spaces, which Telegram will show. \
+                 A `\\n` in a wrapped string literal needs a trailing `\\` or the source \
+                 indentation becomes part of the message.\n\nFull text:\n{text}",
+                n + 1
+            );
         }
     }
 
