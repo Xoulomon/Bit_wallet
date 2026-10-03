@@ -20,7 +20,7 @@ you.
 | **BIP84 native SegWit** | `wpkh(.../84'/{0,1}'/0'/{0,1}/*)`, coin type 0 on mainnet and 1 on regtest. Verified against the BIP84 specification's own test vectors. |
 | **Addresses** | `/receive` gives the next unused address as a QR and a BIP21 URI; `/addresses` lists them with used/unused status. |
 | **Sync** | One shared block emitter serves every user, so a block is fetched once however many wallets exist. |
-| **Balance and history** | Confirmed, pending and immature, in sats and BTC; history with fees and confirmation counts. |
+| **Balance and history** | Confirmed, pending and immature, in sats and BTC, with an approximate `≈ $` value; history with fees and confirmation counts. |
 | **Send** | Fee presets or a typed sat/vB, a confirmation card with every number on it, PIN-gated signing, broadcast, confirmation tracking. `/bumpfee` for a rate that turned out too low. |
 | **Payjoin** | `/pj_receive` opens a BIP77 v2 session; paying a `pj=` URI uses the payjoin sender, falling back to an ordinary transaction if the receiver never answers. |
 | **Two front ends** | The Telegram bot and `wallet-cli` drive the same `WalletService`. Deleting either leaves a working wallet. |
@@ -60,7 +60,10 @@ cp .env.example .env                # fill in TELOXIDE_TOKEN and the REGTEST_* b
 cargo run -p bot
 ```
 
-Then message your bot: `/start`, `/create`, `/receive`, `/mine 101`, `/balance`.
+Then message your bot: `/start`, `/create`, `/mine 101`, `/faucet`, `/balance`.
+`/mine 101` is needed once per chain, to give the node's own wallet something
+to hand out; `/faucet` then pays you from it and mines a block so the coins are
+spendable immediately.
 
 The same wallet from a terminal:
 
@@ -118,6 +121,7 @@ file refuses to load under the wrong chain.
 | `MAINNET_I_UNDERSTAND_RISK` | `false` | Must be `true` or the bot refuses to start on mainnet. |
 | `SESSION_IDLE_TIMEOUT_SECS` | `600` | How long a wallet stays unlocked. |
 | `FEE_CACHE_SECS` | `60` | How long a fee estimate is reused. |
+| `PRICE_API` | `https://mempool.space/api` | BTC/USD for the `≈ $` lines. Used on both chains; unreachable means the lines are simply absent. |
 | `MAX_SEND_SATS` | empty | Optional per-payment cap. Running mainnet without one logs a warning. |
 
 ---
@@ -130,7 +134,7 @@ file refuses to load under the wrong chain.
 | `/help` | This list, in the chat |
 | `/create` | New wallet: PIN, then the seed phrase, then a three-word check |
 | `/restore` | Restore from a seed phrase, with an optional birthday height |
-| `/unlock` · `/lock` | Open or close a signing session |
+| `/unlock` · `/lock` | Open or close a session. A session unlocks reading and drafting — signing always costs a PIN |
 | `/export` | Show your seed phrase again (PIN required, self-deleting) |
 | `/delete` | Delete your wallet — type `DELETE`, then the PIN |
 | `/receive` | Next unused address, as a QR and a BIP21 URI |
@@ -139,12 +143,13 @@ file refuses to load under the wrong chain.
 | `/history [page]` | Transactions, newest first, with fees and confirmations |
 | `/tx <txid>` | One transaction in detail |
 | `/send <address\|bip21> [sats\|max]` | Fee choice → confirmation card → PIN → broadcast |
-| `/bumpfee <txid>` | Raise the fee on a stuck transaction |
+| `/bumpfee <txid>` | Raise the fee on a stuck transaction — the same fee card as `/send` |
 | `/pj_receive <sats>` | Ask to be paid with payjoin |
 | `/pj_sessions` | Payjoin sessions and their state, with cancel |
 | `/status` | Backend tip, latency, call budget, session state |
 | `/network` | Which chain this instance is bound to |
-| `/mine <n>` | Regtest only, admins only |
+| `/mine <n>` | Regtest only, admins only. One message, with the new balance |
+| `/faucet [sats]` | Regtest only. Funds your wallet from the node and mines a block so it is spendable |
 
 `wallet-cli` offers the same set; run it with no arguments for its usage.
 
@@ -186,13 +191,22 @@ PIN. A 6–8 digit PIN is a small search space, so the cost of one guess is the
 whole defence — together with a lockout after five failures, counted in the
 database and shared by every front end.
 
+**A PIN is required for every signature**, not merely when the wallet is locked.
+`confirm_send` takes a `&Pin` rather than anything a session could satisfy, so a
+front end cannot broadcast without one. An open session buys reading and
+drafting; it is not a bearer token for spending. The one exception is
+structural: a payjoin *receive* signs later and on its own, when the sender's
+proposal arrives and nobody is in the chat, so what bounds that is
+`SESSION_IDLE_TIMEOUT_SECS` rather than a PIN.
+
 **What is persisted.** The BDK wallet on disk holds only *public* descriptors.
 Syncing, balances, addresses and history therefore need no PIN, and a stolen
 wallet file reveals your transaction history but cannot spend a satoshi.
 
 **What happens on screen.** Seed phrases are shown once and delete themselves
-after 60 seconds. PIN messages are deleted the moment they arrive. The bot
-refuses to work in group chats at all, before any handler runs.
+after 30 seconds, and the card says so using the same constant the deleter
+uses. PIN messages are deleted the moment they arrive. The bot refuses to work
+in group chats at all, before any handler runs.
 
 **What is never logged.** The mnemonic and `BITRPC_API_KEY` are redacted from
 every `Debug` impl and every error message, and a test greps the source to keep

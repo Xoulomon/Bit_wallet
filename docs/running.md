@@ -174,7 +174,7 @@ BITRPC_API_KEY=... ./scripts/bitrpc-smoke.sh        # check the mainnet allowlis
 # 2. The bot, left running in its own terminal
 cargo run -p bot
 
-# 3. In Telegram: /create — the seed phrase is on screen for 15 seconds
+# 3. In Telegram: /create — the seed phrase is on screen for 30 seconds
 
 # 4. Fund it, without leaving the chat
 #    /mine 101     (admins only, and only needed once per chain)
