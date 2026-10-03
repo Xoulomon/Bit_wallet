@@ -47,7 +47,7 @@ use tokio::sync::broadcast;
 /// the emitter inside `BITRPC_SYNC_BUDGET_PER_MIN` (§6).
 fn poll_interval(cfg: &AppConfig) -> Duration {
     match &cfg.backend {
-        crate::config::BackendConfig::Regtest(_) => Duration::from_secs(5),
+        crate::config::BackendConfig::Core(_) => Duration::from_secs(5),
         crate::config::BackendConfig::Bitrpc(b) => {
             // Leave half the sync allowance for the blocks themselves.
             let polls_per_min = (b.sync_budget_per_min / 2).max(1);
@@ -176,24 +176,37 @@ impl ChainService {
     /// The bookkeeping matters: without it a wallet with fifty transactions
     /// would announce all fifty on every pass, which is worse than announcing
     /// nothing.
+    ///
+    /// A confirmation is announced **once**, when the transaction first lands
+    /// in a block. The climb from two confirmations to a hundred is the same
+    /// fact told again, and telling it again is what turned `/mine 101` into a
+    /// chat full of near-identical lines: every block is a coinbase, and every
+    /// coinbase climbed one rung per pass. A front end that wants the current
+    /// depth asks for it with `/tx`.
     fn announce(&self, user: UserId, change: TxChange, seen: &mut Seen) {
         let confirmations = match change.status {
             TxStatus::Confirmed { confirmations, .. } => confirmations,
             TxStatus::Unconfirmed => 0,
         };
 
-        match seen.announced.get(&change.txid) {
-            Some(previous) if *previous == confirmations => {}
+        match seen.announced.insert(change.txid, confirmations) {
+            // Known and already confirmed: nothing new to say. A reorg that
+            // drops it back to zero and reconfirms will announce again, which
+            // is a change worth hearing about.
+            Some(previous) if previous > 0 => {}
+
+            // Known, and this is the pass that found it in a block.
             Some(_) => {
-                seen.announced.insert(change.txid, confirmations);
-                let _ = self.events.send(CoreEvent::TxConfirmed {
-                    user,
-                    txid: change.txid,
-                    confirmations,
-                });
+                if confirmations > 0 {
+                    let _ = self.events.send(CoreEvent::TxConfirmed {
+                        user,
+                        txid: change.txid,
+                        confirmations,
+                    });
+                }
             }
+
             None => {
-                seen.announced.insert(change.txid, confirmations);
                 if change.incoming {
                     seen.incoming.insert(change.txid);
                     let _ = self.events.send(CoreEvent::IncomingTx {
@@ -326,14 +339,14 @@ pub async fn sync_now(cfg: &AppConfig, user: UserId) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BitrpcConfig, RegtestConfig};
+    use crate::config::{BitrpcConfig, CoreRpcConfig};
     use bdk_wallet::bitcoin::FeeRate;
     use zeroize::Zeroizing;
 
     fn cfg_with(backend: crate::config::BackendConfig) -> AppConfig {
         AppConfig {
             network: match backend {
-                crate::config::BackendConfig::Regtest(_) => crate::NetworkChoice::Regtest,
+                crate::config::BackendConfig::Core(_) => crate::NetworkChoice::Regtest,
                 crate::config::BackendConfig::Bitrpc(_) => crate::NetworkChoice::Mainnet,
             },
             backend,
@@ -341,11 +354,12 @@ mod tests {
             session_idle_timeout: Duration::from_secs(600),
             max_send: None,
             fee_cache: Duration::from_secs(60),
+            price_api: "https://api.coingecko.com/api/v3".into(),
         }
     }
 
     fn regtest() -> crate::config::BackendConfig {
-        crate::config::BackendConfig::Regtest(RegtestConfig {
+        crate::config::BackendConfig::Core(CoreRpcConfig {
             rpc_url: "http://127.0.0.1:18443".into(),
             rpc_user: "u".into(),
             rpc_pass: Zeroizing::new("p".into()),
@@ -400,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn a_transaction_is_announced_once_per_change_and_not_once_per_pass() {
+    fn a_transaction_is_announced_once_when_it_confirms_and_never_again() {
         let (tx, mut rx) = broadcast::channel(32);
         let service = ChainService::new(
             cfg_with(regtest()),
@@ -443,10 +457,21 @@ mod tests {
             other => panic!("expected TxConfirmed, got {other:?}"),
         }
 
-        // And again at six, but not at one a second time.
+        // The climb is silent. This is the whole point: `/mine 101` walks a
+        // coinbase from one confirmation to a hundred and one, and a message
+        // per rung is a chat nobody can read.
+        for depth in [1, 2, 3, 6, 101] {
+            service.announce(user, change(depth), &mut seen);
+            assert!(
+                rx.try_recv().is_err(),
+                "depth {depth} was announced, but it had already confirmed"
+            );
+        }
+
+        // A reorg is different: it stopped being confirmed, so confirming
+        // again is news.
+        service.announce(user, change(0), &mut seen);
         service.announce(user, change(1), &mut seen);
-        assert!(rx.try_recv().is_err());
-        service.announce(user, change(6), &mut seen);
         assert!(matches!(rx.try_recv(), Ok(CoreEvent::TxConfirmed { .. })));
     }
 

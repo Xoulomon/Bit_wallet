@@ -38,7 +38,8 @@ pub async fn status(bot: Bot, msg: Message, ctx: Ctx) -> Result<()> {
                 let user = ctx.users.resolve(from.id.0 as i64).ok()?;
                 ctx.core.session(user).map(|info| info.remaining)
             });
-            bot.send_message(msg.chat.id, ui::status(&s, session))
+            let price = ctx.core.price().await;
+            bot.send_message(msg.chat.id, ui::status(&s, session, price.as_ref()))
                 .parse_mode(ParseMode::Html)
                 .await?;
         }

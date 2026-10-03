@@ -20,7 +20,7 @@ graph TD
         SESSION["session<br/>unlocked seed · idle timer"]
         ONCHAIN["onchain<br/>wallet · sync · quotes · payment"]
         PJ["payjoin<br/>v2 receive · v2/v1 send · persist"]
-        RPC["rpc<br/>ChainSource · fees · retry · budget"]
+        RPC["rpc<br/>ChainSource · fees · price · retry · budget"]
     end
 
     subgraph BACKENDS["Chain sources"]
@@ -188,6 +188,7 @@ what is missing instead of quietly returning an empty result.
 | `estimatesmartfee` | Estimates come from mempool.space, floored at `mempoolminfee`, with a manual rate always available | `rpc/fees.rs` |
 | `testmempoolaccept` | No dry run before broadcast; payjoin's suitability check is best-effort | `service::broadcast`, `payjoin/receive.rs` |
 | `generatetoaddress` | `/mine` is regtest-only | `service::mine` |
+| `sendtoaddress` (wallet RPC) | `/faucet` is regtest-only — it spends the node's own coins, which exist only on a throwaway chain | `service::faucet` |
 
 And one limit that is not a missing method: **100 requests per minute per key,
 shared by every user of the instance**. One `CallBudget` gates every mainnet

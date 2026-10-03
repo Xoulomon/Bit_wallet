@@ -85,6 +85,34 @@ impl Quotes {
         }
     }
 
+    /// Check that a quote is takeable, without consuming it.
+    ///
+    /// `confirm_send` calls this *before* it verifies the PIN. Two things fall
+    /// out, and both matter now that every signature costs a freshly typed PIN
+    /// rather than only the ones made while locked:
+    ///
+    /// * a user who mistypes still has their quote, so the retry is a retry and
+    ///   not a whole new `/send`;
+    /// * a confirm card that expired while they were typing says so, instead of
+    ///   spending one of their attempts against the lockout counter first.
+    ///
+    /// The answer is deliberately the same for a foreign, unknown and stale id,
+    /// exactly as in [`Quotes::take`]. There is a window between `peek` and
+    /// `take`, and it is harmless: `take` re-checks and stays the only consumer.
+    pub fn peek(&self, owner: UserId, id: QuoteId) -> Result<()> {
+        self.sweep();
+
+        let parked = self
+            .parked
+            .lock()
+            .map_err(|_| CoreError::Storage("quote store poisoned".into()))?;
+
+        match parked.get(&id) {
+            Some(entry) if entry.owner == owner && entry.created.elapsed() < QUOTE_TTL => Ok(()),
+            _ => Err(CoreError::QuoteExpired),
+        }
+    }
+
     /// Drop a quote the user cancelled, releasing the inputs it reserved.
     pub fn cancel(&self, owner: UserId, id: QuoteId) {
         if let Ok(mut parked) = self.parked.lock()
@@ -162,6 +190,47 @@ mod tests {
             quotes.take(user, id),
             Err(CoreError::QuoteExpired)
         ));
+    }
+
+    /// `peek` is what lets `confirm_send` check the card before it spends a
+    /// PIN attempt on it, so it must not consume what it reports on.
+    #[test]
+    fn peeking_at_a_quote_leaves_it_takeable() {
+        let quotes = Quotes::new();
+        let user = UserId::new();
+        let id = QuoteId::new();
+        quotes.park(user, quote(id), psbt());
+
+        assert!(quotes.peek(user, id).is_ok());
+        assert!(quotes.peek(user, id).is_ok(), "peeking is not taking");
+        assert_eq!(quotes.len(), 1);
+
+        assert!(quotes.take(user, id).is_ok());
+        assert!(matches!(
+            quotes.peek(user, id),
+            Err(CoreError::QuoteExpired)
+        ));
+    }
+
+    /// The same answer as `take` for every way of not being allowed to have
+    /// it, so `peek` leaks nothing `take` would not have leaked anyway.
+    #[test]
+    fn peeking_at_someone_elses_quote_says_only_that_it_is_gone() {
+        let quotes = Quotes::new();
+        let alice = UserId::new();
+        let mallory = UserId::new();
+        let id = QuoteId::new();
+        quotes.park(alice, quote(id), psbt());
+
+        assert!(matches!(
+            quotes.peek(mallory, id),
+            Err(CoreError::QuoteExpired)
+        ));
+        assert!(matches!(
+            quotes.peek(alice, QuoteId::new()),
+            Err(CoreError::QuoteExpired)
+        ));
+        assert!(quotes.peek(alice, id).is_ok());
     }
 
     /// §10: a QuoteId belonging to another user is rejected.

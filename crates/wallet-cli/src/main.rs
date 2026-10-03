@@ -29,9 +29,7 @@ use wallet_core::{
     AppConfig, WalletService,
     bitcoin::{Amount, FeeRate, Network},
     events::CoreEvent,
-    types::{
-        Auth, Page, PayjoinState, Pin, SendAmount, SendRequest, TxDirection, TxStatus, UserId,
-    },
+    types::{Page, PayjoinState, Pin, SendAmount, SendRequest, TxDirection, TxStatus, UserId},
 };
 
 #[tokio::main]
@@ -145,7 +143,9 @@ async fn run(
             let info = core.next_address(user).await?;
             println!("{}", info.address);
             println!("{}", info.bip21);
-            if network == Network::Bitcoin {
+            // The capability, not the chain: what matters is whether this
+            // backend can see unconfirmed transactions at all.
+            if !core.capabilities().mempool {
                 println!("\nNote: a payment here is invisible until it confirms in a block.");
             }
         }
@@ -254,12 +254,10 @@ async fn run(
                 return Ok(());
             }
 
-            let auth = match core.session(user) {
-                Some(_) => Auth::Session,
-                None => Auth::Pin(read_pin("PIN: ")?),
-            };
+            // Always, even with a session open: signing costs a PIN.
+            let pin = read_pin("PIN: ")?;
 
-            let sent = core.confirm_send(user, quote.id, auth).await?;
+            let sent = core.confirm_send(user, quote.id, &pin).await?;
             println!("\nBroadcast {}", sent.txid);
             if quote.is_payjoin && !sent.payjoin {
                 println!("Payjoin didn't complete; sent as a regular transaction.");
@@ -454,13 +452,16 @@ fn read_pin(label: &str) -> Result<Pin> {
     Ok(Pin::new(prompt(label)?))
 }
 
+/// What to call each chain to a person. Deliberately not Core's own spelling —
+/// "mainnet" reads better than "main" — and deliberately exhaustive, so a new
+/// chain is a compile error rather than the word "unknown".
 fn chain(network: Network) -> &'static str {
     match network {
         Network::Bitcoin => "mainnet",
         Network::Regtest => "regtest",
         Network::Testnet => "testnet",
+        Network::Testnet4 => "testnet4",
         Network::Signet => "signet",
-        _ => "unknown",
     }
 }
 

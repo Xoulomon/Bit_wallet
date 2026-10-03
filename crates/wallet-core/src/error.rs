@@ -95,6 +95,10 @@ pub enum CoreError {
     #[error("this quote is no longer valid")]
     QuoteExpired,
 
+    /// `/bumpfee` cannot apply here, for a reason the user can act on (§6).
+    #[error("cannot bump this fee: {reason}")]
+    CannotBumpFee { reason: FeeBumpRefusal },
+
     /// The node refused the transaction; `reason` is its own words (§6 step 5).
     #[error("broadcast rejected: {reason}")]
     BroadcastRejected { reason: String },
@@ -125,6 +129,52 @@ pub enum CoreError {
     /// Cryptographic failure in the vault (§5) — never carries key material.
     #[error("vault: {0}")]
     Crypto(&'static str),
+}
+
+/// Why a fee bump is impossible.
+///
+/// These are ordinary outcomes, not faults: a confirmed transaction simply
+/// cannot be replaced. Lumping them under a generic wallet error told the user
+/// "something went wrong on this server", which is both wrong and unactionable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeeBumpRefusal {
+    /// Already in a block. Replace-by-fee only works before that.
+    AlreadyConfirmed,
+    /// This wallet has never seen that transaction.
+    NotFound,
+    /// Its inputs did not signal replaceability, so no node will accept a
+    /// replacement.
+    NotReplaceable,
+
+    /// The rate asked for does not beat the original by enough.
+    ///
+    /// A replacement must pay the original's rate plus the incremental relay
+    /// fee, so on a chain with one flat preset the obvious choice — the same
+    /// rate as last time — is always refused. `required` is the lowest rate
+    /// that will be accepted, and drafting *at* it succeeds.
+    RateTooLow { required: FeeRate },
+
+    /// The replacement's absolute fee does not beat the original's.
+    ///
+    /// Distinct from `RateTooLow`: a replacement can be smaller than what it
+    /// replaces, and then a higher rate still buys a lower total.
+    AbsoluteFeeTooLow { required: Amount },
+}
+
+impl std::fmt::Display for FeeBumpRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FeeBumpRefusal::AlreadyConfirmed => f.write_str("already confirmed"),
+            FeeBumpRefusal::NotFound => f.write_str("not found in this wallet"),
+            FeeBumpRefusal::NotReplaceable => f.write_str("does not signal replace-by-fee"),
+            FeeBumpRefusal::RateTooLow { required } => {
+                write!(f, "needs at least {} sat/vB", required.to_sat_per_vb_ceil())
+            }
+            FeeBumpRefusal::AbsoluteFeeTooLow { required } => {
+                write!(f, "needs at least {} sat in fees", required.to_sat())
+            }
+        }
+    }
 }
 
 /// Chain-source failures, kept separate so the bot can retry only where retrying

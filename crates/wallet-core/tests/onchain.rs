@@ -12,7 +12,7 @@ use corepc_node::Node;
 use std::{sync::Arc, time::Duration};
 use wallet_core::{
     AppConfig, NetworkChoice,
-    config::{BackendConfig, RegtestConfig},
+    config::{BackendConfig, CoreRpcConfig},
     service::types::{Page, TxStatus, UserId},
     storage::Storage,
 };
@@ -43,7 +43,7 @@ fn harness() -> Harness {
 
     let cfg = AppConfig {
         network: NetworkChoice::Regtest,
-        backend: BackendConfig::Regtest(RegtestConfig {
+        backend: BackendConfig::Core(CoreRpcConfig {
             rpc_url: node.rpc_url(),
             rpc_user: user,
             rpc_pass: Zeroizing::new(pass),
@@ -55,6 +55,7 @@ fn harness() -> Harness {
         session_idle_timeout: Duration::from_secs(600),
         max_send: None,
         fee_cache: Duration::from_secs(60),
+        price_api: "https://api.coingecko.com/api/v3".into(),
     };
 
     Harness {

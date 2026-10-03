@@ -168,7 +168,14 @@ fn no_secret_is_ever_a_tracing_field() {
                 continue;
             }
 
-            for secret in ["api_key", "mnemonic =", "seed", "pin =", "words"] {
+            for secret in [
+                "api_key",
+                "rpc_pass",
+                "mnemonic =",
+                "seed",
+                "pin =",
+                "words",
+            ] {
                 if code.contains(secret) {
                     offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
                 }

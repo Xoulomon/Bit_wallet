@@ -24,8 +24,8 @@ use corepc_node::Node;
 use std::time::Duration;
 use wallet_core::{
     AppConfig, NetworkChoice, WalletService,
-    config::{BackendConfig, RegtestConfig},
-    service::types::{Auth, Pin, SendAmount, SendRequest, UserId},
+    config::{BackendConfig, CoreRpcConfig},
+    service::types::{Pin, SendAmount, SendRequest, UserId},
 };
 use zeroize::Zeroizing;
 
@@ -57,7 +57,7 @@ fn harness() -> (Node, AppConfig, tempfile::TempDir) {
 
     let cfg = AppConfig {
         network: NetworkChoice::Regtest,
-        backend: BackendConfig::Regtest(RegtestConfig {
+        backend: BackendConfig::Core(CoreRpcConfig {
             rpc_url: node.rpc_url(),
             rpc_user: user,
             rpc_pass: Zeroizing::new(pass),
@@ -69,6 +69,7 @@ fn harness() -> (Node, AppConfig, tempfile::TempDir) {
         session_idle_timeout: Duration::from_secs(1800),
         max_send: None,
         fee_cache: Duration::from_secs(60),
+        price_api: "https://api.coingecko.com/api/v3".into(),
     };
 
     (node, cfg, dir)
@@ -131,9 +132,13 @@ async fn two_wallets_complete_a_v2_payjoin() {
         "the URI offers payjoin"
     );
 
-    // The polling task is already running inside core. Give it a moment to
-    // reach the directory before the sender posts.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait out at least one silent long poll before the sender appears.
+    //
+    // This is the realistic case and it used to break everything: a receiver
+    // whose first poll timed out treated that as fatal and closed the session,
+    // so a payjoin only worked if the sender was already standing there. A
+    // human takes longer than that to scan a QR.
+    tokio::time::sleep(Duration::from_secs(40)).await;
 
     // --- the sender pays it ------------------------------------------------
     let target = core
@@ -160,7 +165,7 @@ async fn two_wallets_complete_a_v2_payjoin() {
     assert!(quote.is_payjoin, "the quote must know this is a payjoin");
 
     let broadcast = core
-        .confirm_send(sender, quote.id, Auth::Session)
+        .confirm_send(sender, quote.id, &pin)
         .await
         .expect("the payjoin completes or falls back, but must not error");
 
@@ -270,7 +275,7 @@ async fn an_unanswered_payjoin_falls_back_to_an_ordinary_payment() {
         .expect("quotes");
 
     let broadcast = core
-        .confirm_send(sender, quote.id, Auth::Session)
+        .confirm_send(sender, quote.id, &pin)
         .await
         .expect("a payjoin that cannot complete must still pay");
 

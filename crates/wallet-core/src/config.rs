@@ -31,14 +31,6 @@ impl NetworkChoice {
             NetworkChoice::Mainnet => "bitcoin",
         }
     }
-
-    /// What `getblockchaininfo.chain` must report for this choice.
-    pub fn expected_chain(self) -> &'static str {
-        match self {
-            NetworkChoice::Regtest => "regtest",
-            NetworkChoice::Mainnet => "main",
-        }
-    }
 }
 
 impl FromStr for NetworkChoice {
@@ -56,9 +48,16 @@ impl FromStr for NetworkChoice {
     }
 }
 
-/// Polar's bitcoind over stock basic auth (§4).
-#[derive(Debug, Clone)]
-pub struct RegtestConfig {
+/// A Bitcoin Core node the operator controls, over stock basic auth (§4).
+///
+/// Shared by regtest (Polar) and any other chain reached the same way: the
+/// difference between them is which chain the node serves, not how we reach it.
+///
+/// `Debug` is hand-written, for the same reason `BitrpcConfig`'s is: `rpc_pass`
+/// is a `Zeroizing<String>`, whose own `Debug` delegates to the inner `String`,
+/// so a derived one prints the node's password (§3a rule 3).
+#[derive(Clone)]
+pub struct CoreRpcConfig {
     pub rpc_url: String,
     pub rpc_user: String,
     pub rpc_pass: Zeroizing<String>,
@@ -66,6 +65,19 @@ pub struct RegtestConfig {
     pub ohttp_relay: String,
     /// Used when `estimatesmartfee` errors on a fresh regtest chain (§6).
     pub fallback_fee: FeeRate,
+}
+
+impl std::fmt::Debug for CoreRpcConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoreRpcConfig")
+            .field("rpc_url", &self.rpc_url)
+            .field("rpc_user", &self.rpc_user)
+            .field("rpc_pass", &"<redacted>")
+            .field("payjoin_directory", &self.payjoin_directory)
+            .field("ohttp_relay", &self.ohttp_relay)
+            .field("fallback_fee", &self.fallback_fee)
+            .finish()
+    }
 }
 
 /// BitRPC's hosted Core over `X-API-Key` (§4b).
@@ -108,7 +120,7 @@ impl std::fmt::Debug for BitrpcConfig {
 /// The active backend: exactly one, chosen by `NETWORK`.
 #[derive(Debug, Clone)]
 pub enum BackendConfig {
-    Regtest(RegtestConfig),
+    Core(CoreRpcConfig),
     Bitrpc(BitrpcConfig),
 }
 
@@ -124,6 +136,13 @@ pub struct AppConfig {
     /// Optional safety cap on a single `/send` (§4).
     pub max_send: Option<Amount>,
     pub fee_cache: Duration,
+    /// CoinGecko's API root, for the BTC/USD price. Not network-specific on
+    /// purpose: a regtest balance is shown at the mainnet price, clearly
+    /// labelled as the play money it is, because the alternative is a feature
+    /// nobody can see working without pointing the bot at real coins.
+    ///
+    /// mempool.space is tried after it, so one blocked host is not no price.
+    pub price_api: String,
 }
 
 impl AppConfig {
@@ -139,7 +158,7 @@ impl AppConfig {
         let network: NetworkChoice = req(src, "NETWORK")?.parse()?;
 
         let backend = match network {
-            NetworkChoice::Regtest => BackendConfig::Regtest(RegtestConfig {
+            NetworkChoice::Regtest => BackendConfig::Core(CoreRpcConfig {
                 rpc_url: opt(src, "REGTEST_RPC_URL")
                     .unwrap_or_else(|| "http://127.0.0.1:18443".into()),
                 rpc_user: req(src, "REGTEST_RPC_USER")?,
@@ -199,6 +218,8 @@ impl AppConfig {
                 _ => None,
             },
             fee_cache: Duration::from_secs(num::<u64>(src, "FEE_CACHE_SECS", 60)?),
+            price_api: opt(src, "PRICE_API")
+                .unwrap_or_else(|| "https://api.coingecko.com/api/v3".into()),
         })
     }
 
@@ -294,10 +315,10 @@ mod tests {
     }
 
     #[test]
-    fn regtest_selects_the_polar_backend() {
+    fn regtest_selects_a_core_node_backend() {
         let cfg = AppConfig::from_source(&base("regtest")).expect("regtest config loads");
         assert_eq!(cfg.network, NetworkChoice::Regtest);
-        assert!(matches!(cfg.backend, BackendConfig::Regtest(_)));
+        assert!(matches!(cfg.backend, BackendConfig::Core(_)));
         assert_eq!(cfg.network_dir(), PathBuf::from("./data/regtest"));
     }
 

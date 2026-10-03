@@ -46,6 +46,22 @@ pub enum Intent {
     },
 }
 
+/// What a fee is being chosen *for*.
+///
+/// A new payment and a replacement both walk the same two screens — preset
+/// keyboard, then optionally a typed rate — and §8.4 says every state that
+/// expects text has exactly one endpoint. Carrying the difference in the state
+/// rather than in a second pair of states keeps that true: one branch, one
+/// endpoint, one copy of the custom-rate rules.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum FeeFor {
+    /// A new payment: the target as the user typed it, and sats — `None` for
+    /// `max`.
+    Pay { target: String, amount: Option<u64> },
+    /// A replacement for a transaction that is taking too long.
+    Bump { txid: String },
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub enum State {
     #[default]
@@ -62,6 +78,16 @@ pub enum State {
     RestoreBirthday {
         words: String,
     },
+    /// TODO: dead. Written nowhere and matched nowhere.
+    ///
+    /// It was to be the "this rescan is deep — are you sure?" step, and the
+    /// flow never needed one: `receive_birthday` shows the plan card and then
+    /// goes straight to `SetPin`, because `restore_preflight` already decides.
+    /// `Refuse` ends the flow outright and `Warn` shows the ETA and proceeds,
+    /// so there is nothing left for the user to confirm.
+    ///
+    /// Kept only so an older persisted row still deserialises; delete it once
+    /// no deployment can be carrying one.
     RestoreConfirmDepth {
         words: String,
         birthday: Option<u32>,
@@ -85,12 +111,10 @@ pub enum State {
     DeleteTypeConfirm,
 
     AwaitFeeChoice {
-        target: String,
-        amount: Option<u64>,
+        what: FeeFor,
     },
     AwaitCustomFee {
-        target: String,
-        amount: Option<u64>,
+        what: FeeFor,
     },
     SendConfirm {
         quote: String,
@@ -297,6 +321,37 @@ mod tests {
         let encoded = serde_json::to_string(&original).expect("serialises");
         let back: State = serde_json::from_str(&encoded).expect("deserialises");
         assert_eq!(original, back);
+    }
+
+    /// Both halves of a fee choice survive a restart, and — more to the point
+    /// — stay distinguishable. A `Bump` that deserialised as a `Pay` would
+    /// quote a brand-new payment to a txid.
+    #[test]
+    fn both_kinds_of_fee_choice_round_trip() {
+        for original in [
+            State::AwaitFeeChoice {
+                what: FeeFor::Pay {
+                    target: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".into(),
+                    amount: Some(50_000),
+                },
+            },
+            // `max`, which is the case a bare `Option` loses silently.
+            State::AwaitFeeChoice {
+                what: FeeFor::Pay {
+                    target: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".into(),
+                    amount: None,
+                },
+            },
+            State::AwaitCustomFee {
+                what: FeeFor::Bump {
+                    txid: "0303030303030303030303030303030303030303030303030303030303030303".into(),
+                },
+            },
+        ] {
+            let encoded = serde_json::to_string(&original).expect("serialises");
+            let back: State = serde_json::from_str(&encoded).expect("deserialises");
+            assert_eq!(original, back);
+        }
     }
 
     #[test]
