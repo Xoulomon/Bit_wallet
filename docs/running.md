@@ -89,12 +89,21 @@ signs later and on its own, when the sender's proposal arrives, so there is no
 moment at which anyone could be asked. What bounds that is
 `SESSION_IDLE_TIMEOUT_SECS`, not a PIN.
 
-`/balance`, the send confirm card, `/tx` and the send receipt carry an
-approximate dollar value, from `PRICE_API` (mempool.space by default) and
-cached for five minutes. On regtest the figure is the real mainnet price
-applied to coins that are worth nothing, and the card says so. If the price
-API cannot be reached the lines are simply absent — no command fails over it,
-and no fee or amount is ever derived from a price.
+`/balance`, the send confirm card, `/tx`, the send receipt, `/faucet`, `/mine`
+and the incoming-payment notification all carry an approximate dollar value.
+It comes from CoinGecko (`PRICE_API`), falling back to mempool.space, cached
+for five minutes. On regtest the figure is the real mainnet price applied to
+coins that are worth nothing, and the card says so.
+
+If no source answers, the lines are simply absent — no command fails over it,
+and no fee or amount is ever derived from a price. **`/status` is where you
+check**: it always draws a Price row, so "unavailable" is distinguishable from
+"this build has no such feature", which a missing line alone is not. The
+sources themselves are checkable without the bot:
+
+```bash
+cargo test -p wallet-core --test price_live -- --ignored --nocapture
+```
 
 A freshly mined coinbase needs 100 more blocks before it is spendable, so
 `/mine 101` is the useful number — and `/mine` reports one result, not one

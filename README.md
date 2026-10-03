@@ -121,7 +121,7 @@ file refuses to load under the wrong chain.
 | `MAINNET_I_UNDERSTAND_RISK` | `false` | Must be `true` or the bot refuses to start on mainnet. |
 | `SESSION_IDLE_TIMEOUT_SECS` | `600` | How long a wallet stays unlocked. |
 | `FEE_CACHE_SECS` | `60` | How long a fee estimate is reused. |
-| `PRICE_API` | `https://mempool.space/api` | BTC/USD for the `≈ $` lines. Used on both chains; unreachable means the lines are simply absent. |
+| `PRICE_API` | `https://api.coingecko.com/api/v3` | BTC/USD for the `≈ $` lines, with mempool.space as an automatic fallback. Used on both chains; if neither answers the lines are absent and `/status` says so. |
 | `MAX_SEND_SATS` | empty | Optional per-payment cap. Running mainnet without one logs a warning. |
 
 ---

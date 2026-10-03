@@ -89,8 +89,15 @@ pub async fn mine(bot: Bot, msg: Message, ctx: Ctx, blocks: String) -> Result<()
     } else {
         None
     };
+    let price = ctx.core.price().await;
 
-    let card = ui::mined(ctx.core.network(), hashes.len(), to_self, balance.as_ref());
+    let card = ui::mined(
+        ctx.core.network(),
+        hashes.len(),
+        to_self,
+        balance.as_ref(),
+        price.as_ref(),
+    );
 
     match status {
         Some(status) => {
@@ -171,6 +178,7 @@ pub async fn faucet(bot: Bot, msg: Message, ctx: Ctx, sats: String) -> Result<()
     // spendable — but this wallet has not looked at that block yet.
     let _ = ctx.core.sync_now(user).await;
     let balance = ctx.core.balance(user).await.ok();
+    let price = ctx.core.price().await;
 
     bot.send_message(
         msg.chat.id,
@@ -180,6 +188,7 @@ pub async fn faucet(bot: Bot, msg: Message, ctx: Ctx, sats: String) -> Result<()
             amount,
             &txid.to_string(),
             balance.as_ref(),
+            price.as_ref(),
         ),
     )
     .parse_mode(ParseMode::Html)

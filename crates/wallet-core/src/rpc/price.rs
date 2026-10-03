@@ -42,8 +42,68 @@ pub trait PriceSource: Send + Sync {
     fn usd_per_btc(&self) -> Result<f64>;
 }
 
+/// A blocking HTTP agent with the same timeout every source uses.
+fn agent() -> ureq::Agent {
+    ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(10)))
+            .build(),
+    )
+}
+
+/// CoinGecko's `/simple/price`. The default, because it is the most widely
+/// reachable free price endpoint and needs no key.
+pub struct CoinGecko {
+    base: String,
+    agent: ureq::Agent,
+}
+
+impl CoinGecko {
+    pub fn new(base: impl Into<String>) -> Self {
+        CoinGecko {
+            base: base.into(),
+            agent: agent(),
+        }
+    }
+}
+
+/// `{"bitcoin":{"usd":84581}}`
+#[derive(serde::Deserialize)]
+struct CoinGeckoBody {
+    bitcoin: CoinGeckoUsd,
+}
+
+#[derive(serde::Deserialize)]
+struct CoinGeckoUsd {
+    usd: f64,
+}
+
+impl PriceSource for CoinGecko {
+    fn name(&self) -> &str {
+        "CoinGecko"
+    }
+
+    fn usd_per_btc(&self) -> Result<f64> {
+        let url = format!(
+            "{}/simple/price?ids=bitcoin&vs_currencies=usd",
+            self.base.trim_end_matches('/')
+        );
+        let body: CoinGeckoBody = self
+            .agent
+            .get(&url)
+            .call()
+            .map_err(|e| CoreError::Wallet(e.to_string()))?
+            .into_body()
+            .read_json()
+            .map_err(|e| CoreError::Wallet(e.to_string()))?;
+
+        usable(body.bitcoin.usd)
+    }
+}
+
 /// mempool.space's `/v1/prices` — the same host `fees.rs` already asks about
-/// fees, so a deployment that can reach one can reach the other.
+/// fees, kept as the fallback so a deployment that can reach one can still
+/// show a number when the other is blocked or rate-limiting.
 pub struct MempoolSpacePrice {
     base: String,
     agent: ureq::Agent,
@@ -53,11 +113,7 @@ impl MempoolSpacePrice {
     pub fn new(base: impl Into<String>) -> Self {
         MempoolSpacePrice {
             base: base.into(),
-            agent: ureq::Agent::new_with_config(
-                ureq::Agent::config_builder()
-                    .timeout_global(Some(Duration::from_secs(10)))
-                    .build(),
-            ),
+            agent: agent(),
         }
     }
 }
@@ -84,18 +140,26 @@ impl PriceSource for MempoolSpacePrice {
             .read_json()
             .map_err(|e| CoreError::Wallet(e.to_string()))?;
 
-        if !body.usd.is_finite() || body.usd <= 0.0 {
-            return Err(CoreError::Wallet(
-                "price api returned no usable price".into(),
-            ));
-        }
-        Ok(body.usd)
+        usable(body.usd)
     }
+}
+
+/// Zero, negative, NaN and infinity are all "no price", not a price. Letting
+/// one through would render `≈ $0.00` over a real balance.
+fn usable(usd: f64) -> Result<f64> {
+    if !usd.is_finite() || usd <= 0.0 {
+        return Err(CoreError::Wallet(
+            "price api returned no usable price".into(),
+        ));
+    }
+    Ok(usd)
 }
 
 /// The cached price, and the policy around it.
 pub struct PriceFeed {
-    source: Box<dyn PriceSource>,
+    /// Tried in order. The first that answers wins; the rest exist so one
+    /// blocked or rate-limiting host does not mean no price at all.
+    sources: Vec<Box<dyn PriceSource>>,
     ttl: Duration,
     /// The last answer and when it was given. `None` inside the tuple is a
     /// remembered *failure*, which is why this is not `Option<(Instant, f64)>`.
@@ -103,14 +167,26 @@ pub struct PriceFeed {
 }
 
 impl PriceFeed {
+    /// CoinGecko first, mempool.space second.
+    ///
+    /// `api` configures CoinGecko, which is the one an operator is likely to
+    /// want to point elsewhere; the fallback is fixed because its only job is
+    /// to be a second opinion when the first host cannot be reached.
     pub fn new(api: &str) -> Self {
-        PriceFeed::with_source(Box::new(MempoolSpacePrice::new(api)))
+        PriceFeed::with_sources(vec![
+            Box::new(CoinGecko::new(api)),
+            Box::new(MempoolSpacePrice::new("https://mempool.space/api")),
+        ])
     }
 
     /// The seam §6 asks for, so a test never touches the network.
     pub fn with_source(source: Box<dyn PriceSource>) -> Self {
+        PriceFeed::with_sources(vec![source])
+    }
+
+    pub fn with_sources(sources: Vec<Box<dyn PriceSource>>) -> Self {
         PriceFeed {
-            source,
+            sources,
             ttl: PRICE_CACHE,
             cache: Mutex::new(None),
         }
@@ -132,24 +208,34 @@ impl PriceFeed {
             }
         }
 
-        let fetched = match self.source.usd_per_btc() {
-            Ok(usd_per_btc) => Some(FiatPrice {
-                usd_per_btc,
-                source: self.source.name().to_string(),
-                fetched_at: SystemTime::now(),
-            }),
-            Err(e) => {
-                // Worth a line, but not worth bothering the user about: the
-                // card renders without the dollar figure and says nothing.
-                tracing::debug!(error = %e, "no price available");
-                None
-            }
-        };
-
+        let fetched = self.fetch();
         if let Ok(mut cache) = self.cache.lock() {
             *cache = Some((Instant::now(), fetched.clone()));
         }
         fetched
+    }
+
+    fn fetch(&self) -> Option<FiatPrice> {
+        for source in &self.sources {
+            match source.usd_per_btc() {
+                Ok(usd_per_btc) => {
+                    return Some(FiatPrice {
+                        usd_per_btc,
+                        source: source.name().to_string(),
+                        fetched_at: SystemTime::now(),
+                    });
+                }
+                Err(e) => {
+                    // `warn`, not `debug`. A missing dollar line is invisible
+                    // in the chat — the card simply renders without it — so if
+                    // this is quiet too there is nothing anywhere to tell an
+                    // operator the feature is failing rather than absent.
+                    tracing::warn!(source = source.name(), error = %e, "price source failed");
+                }
+            }
+        }
+        tracing::warn!("no price source answered; dollar values will be omitted");
+        None
     }
 }
 

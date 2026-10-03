@@ -111,7 +111,14 @@ async fn deliver(bot: &Bot, ctx: &Ctx, event: CoreEvent) {
     };
 
     let text = match &event {
-        CoreEvent::IncomingTx { amount, status, .. } => crate::ui::incoming(*amount, *status),
+        // Money arriving is the one notification where the dollar figure is
+        // the first thing anyone wants, so this is the only event that pays
+        // for a price lookup. It is cached for five minutes, so a burst of
+        // incoming payments costs one fetch between them.
+        CoreEvent::IncomingTx { amount, status, .. } => {
+            let price = ctx.core.price().await;
+            crate::ui::incoming(*amount, *status, price.as_ref())
+        }
 
         // Handled before this point, so it can be gathered with the rest of
         // its burst rather than sent on its own.

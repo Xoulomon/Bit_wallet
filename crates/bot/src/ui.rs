@@ -115,7 +115,17 @@ pub fn welcome(network: Network, has_wallet: bool) -> String {
 }
 
 /// `/status` (§8.2). The call budget appears only where there is one to spend.
-pub fn status(s: &BackendStatus, session: Option<std::time::Duration>) -> String {
+///
+/// The price row is always drawn, including when there is no price. A missing
+/// dollar figure elsewhere is invisible — the card simply renders without it —
+/// so this is the one place that can distinguish "the feature is off" from
+/// "the price source is unreachable", which is exactly the question an
+/// operator has when the numbers stop appearing.
+pub fn status(
+    s: &BackendStatus,
+    session: Option<std::time::Duration>,
+    price: Option<&FiatPrice>,
+) -> String {
     let mut out = format!(
         "{}\n\n<b>Backend</b>\nTip      {}\nLatency  {} ms",
         badge(s.network),
@@ -130,6 +140,15 @@ pub fn status(s: &BackendStatus, session: Option<std::time::Duration>) -> String
     if s.degraded {
         out.push_str("\n\n⚠️ The backend is slow or rate-limited; commands may lag.");
     }
+
+    out.push_str(&match price {
+        Some(p) => format!(
+            "\n\n<b>Price</b>\n1 BTC ≈ ${} ({})",
+            group(p.usd_per_btc.round() as u64),
+            escape(&p.source)
+        ),
+        None => "\n\n<b>Price</b>\nUnavailable — dollar values are hidden.".to_string(),
+    });
 
     out.push_str(&match session {
         Some(left) => format!(
@@ -806,13 +825,17 @@ fn pager(page: Page, total_pages: u32) -> String {
 // -------------------------------------------------------------- notifications
 // §8.6: one match, one message. Core supplies the numbers; every word is here.
 
-pub fn incoming(amount: Amount, status: TxStatus) -> String {
-    match status {
+pub fn incoming(amount: Amount, status: TxStatus, price: Option<&FiatPrice>) -> String {
+    let mut out = match status {
         TxStatus::Unconfirmed => format!("📥 Incoming {} — unconfirmed", sats(amount)),
         TxStatus::Confirmed { confirmations, .. } => {
             format!("📥 Received {} — ✅ {} conf", sats(amount), confirmations)
         }
+    };
+    if let Some(price) = price {
+        out.push_str(&format!("\n{}", usd(amount, price)));
     }
+    out
 }
 
 pub fn confirmed(txid: &str, confirmations: u32) -> String {
@@ -1027,14 +1050,17 @@ mod onchain_tests {
 
     #[test]
     fn notifications_distinguish_arrival_from_confirmation() {
-        assert!(incoming(Amount::from_sat(25_000), TxStatus::Unconfirmed).contains("unconfirmed"));
+        assert!(
+            incoming(Amount::from_sat(25_000), TxStatus::Unconfirmed, None).contains("unconfirmed")
+        );
         assert!(
             incoming(
                 Amount::from_sat(25_000),
                 TxStatus::Confirmed {
                     height: 1,
                     confirmations: 1
-                }
+                },
+                None,
             )
             .contains("Received")
         );
@@ -1221,13 +1247,17 @@ pub fn confirm_card(network: Network, q: &SendQuote, price: Option<&FiatPrice>) 
         "{} · <b>{header}</b>\n\n\
          <code>To      {}</code>\n\
          <code>Amount  {}</code>\n\
-         <code>Fee     {} @ {} sat/vB</code>\n\
+         <code>Fee     {} @ {} sat/vB{}</code>\n\
          <code>Total   {}</code>",
         badge(network),
         escape(&shorten(&q.recipient.to_string())),
         sats_and_btc(q.amount),
         sats(q.fee),
         q.fee_rate.to_sat_per_vb_ceil(),
+        match price {
+            Some(p) => format!(" · {}", usd(q.fee, p)),
+            None => String::new(),
+        },
         sats(q.total)
     );
 
@@ -1365,6 +1395,7 @@ pub fn faucet_sent(
     amount: Amount,
     txid: &str,
     balance: Option<&BalanceView>,
+    price: Option<&FiatPrice>,
 ) -> String {
     let mut out = format!(
         "{} · 🚰 Sent {} to your wallet, and mined a block so it is spendable now.\n\n\
@@ -1379,6 +1410,9 @@ pub fn faucet_sent(
             "\n\n<b>Confirmed {}</b>",
             sats_and_btc(b.confirmed)
         ));
+        if let Some(p) = price {
+            out.push_str(&format!("\n<b>{}</b>", usd(b.confirmed, p)));
+        }
     }
 
     // In full, inside <code>, for the same reason /send does it: a shortened
@@ -1409,6 +1443,7 @@ pub fn mined(
     blocks: usize,
     to_self: bool,
     balance: Option<&BalanceView>,
+    price: Option<&FiatPrice>,
 ) -> String {
     let mut out = format!("{} · ⛏ Mined {blocks} block(s).", badge(network));
 
@@ -1419,6 +1454,12 @@ pub fn mined(
         ));
         if b.immature > Amount::ZERO {
             out.push_str(&format!("\n<code>Immature   {}</code>", sats(b.immature)));
+        }
+        if let Some(p) = price {
+            out.push_str(&format!(
+                "\n<code>           {}</code>",
+                usd(b.confirmed, p)
+            ));
         }
     }
 
@@ -2083,6 +2124,58 @@ mod html_tests {
                     Some(&price),
                 ),
             );
+            // /status had no coverage at all, and it now interpolates a
+            // third-party string (the price source's own name) into a
+            // message. Both shapes: with a price and without one.
+            let backend = wallet_core::types::BackendStatus {
+                network,
+                tip_height: 969_591,
+                tip_hash: wallet_core::bitcoin::BlockHash::from_raw_hash(
+                    wallet_core::bitcoin::hashes::Hash::from_byte_array([0u8; 32]),
+                ),
+                latency: Duration::from_millis(42),
+                calls_used: Some(7),
+                call_budget: Some(90),
+                degraded: true,
+            };
+            assert_sendable(
+                "status/priced",
+                &status(&backend, Some(Duration::from_secs(300)), Some(&price)),
+            );
+            assert_sendable("status/no price", &status(&backend, None, None));
+
+            assert_sendable(
+                "incoming/priced",
+                &incoming(
+                    Amount::from_sat(25_000),
+                    TxStatus::Unconfirmed,
+                    Some(&price),
+                ),
+            );
+            let earned = BalanceView {
+                confirmed: Amount::from_sat(5_000_000_000),
+                trusted_pending: Amount::ZERO,
+                untrusted_pending: Amount::ZERO,
+                immature: Amount::from_sat(500_000_000_000),
+                total: Amount::from_sat(505_000_000_000),
+                unconfirmed_incoming_visible: true,
+            };
+            assert_sendable(
+                "mined/priced",
+                &mined(network, 101, true, Some(&earned), Some(&price)),
+            );
+            assert_sendable(
+                "faucet_sent/priced",
+                &faucet_sent(
+                    network,
+                    "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
+                    Amount::from_sat(100_000),
+                    &txid(7).to_string(),
+                    Some(&earned),
+                    Some(&price),
+                ),
+            );
+
             assert_sendable("wrong_pin_retry", &wrong_pin_retry(3));
             assert_sendable("fee_rate_out_of_range", &fee_rate_out_of_range());
             assert_sendable("faucet_usage", &faucet_usage(1_000, 10_000_000));
@@ -2096,11 +2189,12 @@ mod html_tests {
                     Amount::from_sat(100_000),
                     &txid(7).to_string(),
                     None,
+                    None,
                 ),
             );
             assert_sendable("mining", &mining(network, 101));
-            assert_sendable("mined/self", &mined(network, 101, true, None));
-            assert_sendable("mined/node", &mined(network, 1, false, None));
+            assert_sendable("mined/self", &mined(network, 101, true, None, None));
+            assert_sendable("mined/node", &mined(network, 1, false, None, None));
 
             // With a balance folded in, which is the shape /mine actually
             // sends when it mined to the caller's own wallet.
@@ -2114,7 +2208,7 @@ mod html_tests {
             };
             assert_sendable(
                 "mined/balance",
-                &mined(network, 101, true, Some(&mined_balance)),
+                &mined(network, 101, true, Some(&mined_balance), None),
             );
 
             let b = Broadcast {
@@ -2323,7 +2417,7 @@ mod html_tests {
         assert_sendable("confirmed_many", &confirmed_many(101));
         assert_sendable(
             "incoming",
-            &incoming(Amount::from_sat(1), TxStatus::Unconfirmed),
+            &incoming(Amount::from_sat(1), TxStatus::Unconfirmed, None),
         );
         assert_sendable("session_expired", &session_expired());
         assert_sendable("backend_degraded", &backend_degraded());

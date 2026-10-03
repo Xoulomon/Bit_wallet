@@ -55,7 +55,7 @@ fn harness() -> Harness {
         session_idle_timeout: Duration::from_secs(600),
         max_send: None,
         fee_cache: Duration::from_secs(60),
-        price_api: "https://mempool.space/api".into(),
+        price_api: "https://api.coingecko.com/api/v3".into(),
     };
 
     Harness {
