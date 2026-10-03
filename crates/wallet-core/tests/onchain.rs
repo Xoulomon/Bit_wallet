@@ -12,7 +12,7 @@ use corepc_node::Node;
 use std::{sync::Arc, time::Duration};
 use wallet_core::{
     AppConfig, NetworkChoice,
-    config::{BackendConfig, RegtestConfig},
+    config::{BackendConfig, CoreRpcConfig},
     service::types::{Page, TxStatus, UserId},
     storage::Storage,
 };
@@ -43,7 +43,7 @@ fn harness() -> Harness {
 
     let cfg = AppConfig {
         network: NetworkChoice::Regtest,
-        backend: BackendConfig::Regtest(RegtestConfig {
+        backend: BackendConfig::Core(CoreRpcConfig {
             rpc_url: node.rpc_url(),
             rpc_user: user,
             rpc_pass: Zeroizing::new(pass),

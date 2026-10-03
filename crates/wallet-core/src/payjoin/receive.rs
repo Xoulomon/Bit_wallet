@@ -437,7 +437,7 @@ fn floor_rate(cfg: &AppConfig) -> Result<FeeRate> {
 
 pub fn endpoints(cfg: &AppConfig) -> (String, String) {
     match &cfg.backend {
-        crate::config::BackendConfig::Regtest(r) => {
+        crate::config::BackendConfig::Core(r) => {
             (r.payjoin_directory.clone(), r.ohttp_relay.clone())
         }
         crate::config::BackendConfig::Bitrpc(b) => {

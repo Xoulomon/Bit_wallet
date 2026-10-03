@@ -11,7 +11,7 @@ use corepc_node::Node;
 use std::time::Duration;
 use wallet_core::{
     AppConfig, NetworkChoice, WalletService,
-    config::{BackendConfig, RegtestConfig},
+    config::{BackendConfig, CoreRpcConfig},
     service::types::{Page, Pin, QuoteId, SendAmount, SendRequest, UserId},
 };
 use zeroize::Zeroizing;
@@ -26,7 +26,7 @@ fn harness() -> (Node, AppConfig, tempfile::TempDir) {
 
     let cfg = AppConfig {
         network: NetworkChoice::Regtest,
-        backend: BackendConfig::Regtest(RegtestConfig {
+        backend: BackendConfig::Core(CoreRpcConfig {
             rpc_url: node.rpc_url(),
             rpc_user: user,
             rpc_pass: Zeroizing::new(pass),

@@ -1,15 +1,17 @@
-//! Regtest: Polar's bitcoind over stock basic auth (PLAN.md §3, §4).
+//! A Bitcoin Core node we control, over stock basic auth (PLAN.md §3, §4).
 //!
 //! Nothing clever is needed here — which is the point of keeping it beside
-//! `bitrpc.rs`: the difference between the two networks is one constructor.
+//! `bitrpc.rs`: the difference between a node we run and a hosted allowlisted
+//! proxy is one constructor. Which *chain* the node serves is not this
+//! module's business; `ChainSource::connect` reads that from the config.
 
 use crate::{
-    config::RegtestConfig,
+    config::CoreRpcConfig,
     error::{BackendError, CoreError, Result},
 };
 use bitcoincore_rpc::{Auth, Client};
 
-pub fn client(cfg: &RegtestConfig) -> Result<Client> {
+pub fn client(cfg: &CoreRpcConfig) -> Result<Client> {
     at(cfg, &cfg.rpc_url)
 }
 
@@ -22,14 +24,14 @@ pub fn client(cfg: &RegtestConfig) -> Result<Client> {
 ///
 /// > Multiple wallets are loaded. Please select which wallet to use by
 /// > requesting the RPC through the /wallet/<walletname> URI path.
-pub fn wallet_client(cfg: &RegtestConfig, wallet: &str) -> Result<Client> {
+pub fn wallet_client(cfg: &CoreRpcConfig, wallet: &str) -> Result<Client> {
     at(
         cfg,
         &format!("{}/wallet/{}", cfg.rpc_url.trim_end_matches('/'), wallet),
     )
 }
 
-fn at(cfg: &RegtestConfig, url: &str) -> Result<Client> {
+fn at(cfg: &CoreRpcConfig, url: &str) -> Result<Client> {
     Client::new(
         url,
         Auth::UserPass(cfg.rpc_user.clone(), cfg.rpc_pass.to_string()),

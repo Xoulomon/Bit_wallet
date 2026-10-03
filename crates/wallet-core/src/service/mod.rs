@@ -57,7 +57,7 @@ fn node_address(cfg: &AppConfig, client: &bitcoincore_rpc::Client) -> Result<Add
     use bitcoincore_rpc::RpcApi as _;
 
     let regtest = match &cfg.backend {
-        BackendConfig::Regtest(r) => r,
+        BackendConfig::Core(r) => r,
         BackendConfig::Bitrpc(_) => {
             return Err(CoreError::UnsupportedOnNetwork {
                 network: cfg.network.network(),
@@ -70,10 +70,10 @@ fn node_address(cfg: &AppConfig, client: &bitcoincore_rpc::Client) -> Result<Add
         .map_err(crate::rpc::map_rpc_error("listwallets"))?;
 
     let scoped = match loaded.first() {
-        Some(name) => crate::rpc::polar::wallet_client(regtest, name)?,
+        Some(name) => crate::rpc::corerpc::wallet_client(regtest, name)?,
         // No wallet loaded at all: the bare client is unambiguous, and Core
         // will say so clearly if there is genuinely nowhere to put an address.
-        None => crate::rpc::polar::client(regtest)?,
+        None => crate::rpc::corerpc::client(regtest)?,
     };
 
     scoped
@@ -501,12 +501,12 @@ pub fn plan_restore(backend: &BackendConfig, tip: u32, birthday: Option<u32>) ->
         // budget in blocks per minute.
         let blocks_per_min = match backend {
             BackendConfig::Bitrpc(b) => (b.sync_budget_per_min / 2).max(1),
-            BackendConfig::Regtest(_) => 600,
+            BackendConfig::Core(_) => 600,
         };
         let eta = Duration::from_secs(u64::from(depth) * 60 / u64::from(blocks_per_min));
 
         let verdict = match backend {
-            BackendConfig::Regtest(_) => RestoreVerdict::Proceed,
+            BackendConfig::Core(_) => RestoreVerdict::Proceed,
             BackendConfig::Bitrpc(b) if depth > b.max_rescan_blocks => RestoreVerdict::Refuse {
                 max: b.max_rescan_blocks,
             },
@@ -995,7 +995,7 @@ impl WalletService {
             use bitcoincore_rpc::RpcApi as _;
 
             let regtest = match &cfg.backend {
-                BackendConfig::Regtest(r) => r,
+                BackendConfig::Core(r) => r,
                 BackendConfig::Bitrpc(_) => {
                     return Err(CoreError::UnsupportedOnNetwork {
                         network: cfg.network.network(),
@@ -1016,7 +1016,7 @@ impl WalletService {
 
             let mut richest: Option<(bitcoincore_rpc::Client, Amount)> = None;
             for name in &loaded {
-                let scoped = crate::rpc::polar::wallet_client(regtest, name)?;
+                let scoped = crate::rpc::corerpc::wallet_client(regtest, name)?;
                 let balance = scoped
                     .get_balance(None, None)
                     .map_err(crate::rpc::map_rpc_error("getbalance"))?;
@@ -1064,7 +1064,7 @@ impl WalletService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BitrpcConfig, RegtestConfig};
+    use crate::config::{BitrpcConfig, CoreRpcConfig};
 
     fn bitrpc(max_rescan: u32) -> BackendConfig {
         BackendConfig::Bitrpc(BitrpcConfig {
@@ -1081,7 +1081,7 @@ mod tests {
     }
 
     fn regtest() -> BackendConfig {
-        BackendConfig::Regtest(RegtestConfig {
+        BackendConfig::Core(CoreRpcConfig {
             rpc_url: "http://127.0.0.1:18443".into(),
             rpc_user: "polaruser".into(),
             rpc_pass: Zeroizing::new("polarpass".into()),

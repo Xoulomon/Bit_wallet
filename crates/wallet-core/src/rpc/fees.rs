@@ -111,7 +111,7 @@ impl FeePolicy {
         let estimator: Option<Box<dyn FeeEstimator>> = match &cfg.backend {
             BackendConfig::Bitrpc(b) => Some(Box::new(MempoolSpace::new(b.fee_api.clone()))),
             // Regtest asks its own node; there is nothing external to call.
-            BackendConfig::Regtest(_) => None,
+            BackendConfig::Core(_) => None,
         };
         FeePolicy {
             cfg: cfg.clone(),
@@ -138,7 +138,7 @@ impl FeePolicy {
 
         let floor = self.floor();
         let options = match &self.cfg.backend {
-            BackendConfig::Regtest(r) => self.regtest_options(r, floor),
+            BackendConfig::Core(r) => self.regtest_options(r, floor),
             BackendConfig::Bitrpc(_) => self.mainnet_options(floor),
         };
 
@@ -151,7 +151,7 @@ impl FeePolicy {
     /// Regtest: `estimatesmartfee` at our own node, falling back to the
     /// configured rate — which is every fresh regtest chain, because a chain
     /// with no fee history has nothing to estimate from (§6).
-    fn regtest_options(&self, r: &crate::config::RegtestConfig, floor: FeeRate) -> FeeOptions {
+    fn regtest_options(&self, r: &crate::config::CoreRpcConfig, floor: FeeRate) -> FeeOptions {
         let estimated = self.estimatesmartfee();
 
         let (presets, source) = match estimated {
@@ -213,9 +213,7 @@ impl FeePolicy {
     pub fn floor(&self) -> FeeRate {
         let configured = match &self.cfg.backend {
             BackendConfig::Bitrpc(b) => b.min_fee,
-            BackendConfig::Regtest(_) => {
-                FeeRate::from_sat_per_vb(1).unwrap_or(FeeRate::BROADCAST_MIN)
-            }
+            BackendConfig::Core(_) => FeeRate::from_sat_per_vb(1).unwrap_or(FeeRate::BROADCAST_MIN),
         };
 
         match self.mempool_min_fee() {
@@ -275,7 +273,7 @@ pub fn check_rate(given: FeeRate, floor: FeeRate) -> Result<FeeRate> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BitrpcConfig, RegtestConfig};
+    use crate::config::{BitrpcConfig, CoreRpcConfig};
     use zeroize::Zeroizing;
 
     struct Fixed(Estimates);
@@ -327,7 +325,7 @@ mod tests {
     fn regtest_cfg(fallback: u64) -> AppConfig {
         AppConfig {
             network: crate::NetworkChoice::Regtest,
-            backend: BackendConfig::Regtest(RegtestConfig {
+            backend: BackendConfig::Core(CoreRpcConfig {
                 // Unreachable on purpose: estimatesmartfee must fail and the
                 // fallback must take over, which is the regtest case in §6.
                 rpc_url: "http://127.0.0.1:1".into(),

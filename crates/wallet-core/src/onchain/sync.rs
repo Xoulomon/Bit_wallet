@@ -47,7 +47,7 @@ use tokio::sync::broadcast;
 /// the emitter inside `BITRPC_SYNC_BUDGET_PER_MIN` (§6).
 fn poll_interval(cfg: &AppConfig) -> Duration {
     match &cfg.backend {
-        crate::config::BackendConfig::Regtest(_) => Duration::from_secs(5),
+        crate::config::BackendConfig::Core(_) => Duration::from_secs(5),
         crate::config::BackendConfig::Bitrpc(b) => {
             // Leave half the sync allowance for the blocks themselves.
             let polls_per_min = (b.sync_budget_per_min / 2).max(1);
@@ -339,14 +339,14 @@ pub async fn sync_now(cfg: &AppConfig, user: UserId) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BitrpcConfig, RegtestConfig};
+    use crate::config::{BitrpcConfig, CoreRpcConfig};
     use bdk_wallet::bitcoin::FeeRate;
     use zeroize::Zeroizing;
 
     fn cfg_with(backend: crate::config::BackendConfig) -> AppConfig {
         AppConfig {
             network: match backend {
-                crate::config::BackendConfig::Regtest(_) => crate::NetworkChoice::Regtest,
+                crate::config::BackendConfig::Core(_) => crate::NetworkChoice::Regtest,
                 crate::config::BackendConfig::Bitrpc(_) => crate::NetworkChoice::Mainnet,
             },
             backend,
@@ -359,7 +359,7 @@ mod tests {
     }
 
     fn regtest() -> crate::config::BackendConfig {
-        crate::config::BackendConfig::Regtest(RegtestConfig {
+        crate::config::BackendConfig::Core(CoreRpcConfig {
             rpc_url: "http://127.0.0.1:18443".into(),
             rpc_user: "u".into(),
             rpc_pass: Zeroizing::new("p".into()),
