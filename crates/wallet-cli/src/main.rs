@@ -143,7 +143,9 @@ async fn run(
             let info = core.next_address(user).await?;
             println!("{}", info.address);
             println!("{}", info.bip21);
-            if network == Network::Bitcoin {
+            // The capability, not the chain: what matters is whether this
+            // backend can see unconfirmed transactions at all.
+            if !core.capabilities().mempool {
                 println!("\nNote: a payment here is invisible until it confirms in a block.");
             }
         }
@@ -450,13 +452,16 @@ fn read_pin(label: &str) -> Result<Pin> {
     Ok(Pin::new(prompt(label)?))
 }
 
+/// What to call each chain to a person. Deliberately not Core's own spelling —
+/// "mainnet" reads better than "main" — and deliberately exhaustive, so a new
+/// chain is a compile error rather than the word "unknown".
 fn chain(network: Network) -> &'static str {
     match network {
         Network::Bitcoin => "mainnet",
         Network::Regtest => "regtest",
         Network::Testnet => "testnet",
+        Network::Testnet4 => "testnet4",
         Network::Signet => "signet",
-        _ => "unknown",
     }
 }
 

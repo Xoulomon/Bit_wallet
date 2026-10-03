@@ -11,13 +11,53 @@ use wallet_core::{BackendError, CoreError};
 
 /// The network badge of §8.1. On mainnet it leads the first line, so a mistaken
 /// network is visible before an amount is read.
+///
+/// **No catch-all arm, deliberately.** `bitcoin::Network` is not
+/// `#[non_exhaustive]`, so an exhaustive match makes a new chain a compile
+/// error right here. This function had a `_ => "❔ UNKNOWN"` and it is exactly
+/// what hid `Testnet4` being missing: every card leads with this badge, so the
+/// whole UI would have read UNKNOWN, and nothing would have failed to build.
 pub fn badge(network: Network) -> &'static str {
     match network {
         Network::Bitcoin => "🟠 MAINNET",
         Network::Regtest => "🧪 REGTEST",
         Network::Testnet => "🧪 TESTNET",
+        // Spell the 4 out: which testnet you are on is the whole question,
+        // and a screenshot saying only TESTNET does not answer it.
+        Network::Testnet4 => "🧪 TESTNET4",
         Network::Signet => "🧪 SIGNET",
-        _ => "❔ UNKNOWN",
+    }
+}
+
+/// Where this chain's transactions can be looked up, or `None` where they
+/// cannot.
+///
+/// `Option` rather than an empty string on purpose: it makes "there is no
+/// explorer" a case the caller has to handle, and it makes
+/// `if network == Network::Bitcoin` — which is how three cards quietly lost
+/// their links on every chain but mainnet — impossible to write again.
+///
+/// Exhaustive, for the same reason [`badge`] is.
+fn explorer_base(network: Network) -> Option<&'static str> {
+    match network {
+        Network::Bitcoin => Some("https://mempool.space"),
+        Network::Testnet => Some("https://mempool.space/testnet"),
+        Network::Testnet4 => Some("https://mempool.space/testnet4"),
+        Network::Signet => Some("https://mempool.space/signet"),
+        // A private chain nobody else can see. There is nothing to link to.
+        Network::Regtest => None,
+    }
+}
+
+/// An anchor to one transaction, or empty where the chain has no explorer.
+fn tx_link(network: Network, txid: &str, text: &str) -> String {
+    match explorer_base(network) {
+        Some(base) => format!(
+            "<a href=\"{base}/tx/{}\">{}</a>",
+            escape(txid),
+            escape(text)
+        ),
+        None => String::new(),
     }
 }
 
@@ -163,6 +203,9 @@ pub fn status(
 
 /// What this instance is bound to, and that its state is namespaced (§8.2).
 pub fn network_card(network: Network) -> String {
+    // Exhaustive, because the `_` arm this replaced told every chain but
+    // mainnet that `/mine 101` mints blocks — true only where nobody has to
+    // do real work to make a block.
     let body = match network {
         Network::Bitcoin => {
             "Real bitcoin, on the real chain. Transactions cannot be reversed.\n\n\
@@ -172,14 +215,22 @@ pub fn network_card(network: Network) -> String {
              • fee estimates come from an external API, and every rate is floored at the \
              node's own minimum."
         }
-        _ => {
+        Network::Regtest => {
             "A private test chain. These coins are worth nothing — which is exactly what \
              makes it the right place to learn the flows.\n\n\
              <code>/mine 101</code> mints blocks (admins only)."
         }
+        Network::Testnet | Network::Testnet4 | Network::Signet => {
+            "A public test chain. The coins are worth nothing and anyone can get them \
+             from a faucet — but everything else is real: real blocks, real miners, real \
+             waiting, and a real chain behind you.\n\n\
+             There is no <code>/mine</code> and no <code>/faucet</code> here. Nobody owns \
+             this chain, so blocks arrive when they arrive, and coins come from a public \
+             faucet rather than from this bot."
+        }
     };
     format!(
-        "{}\n\n{body}\n\nState for each network is stored separately; the two can never mix.",
+        "{}\n\n{body}\n\nState for each network is stored separately; they can never mix.",
         badge(network)
     )
 }
@@ -643,7 +694,11 @@ pub fn balance(network: Network, b: &BalanceView, price: Option<&FiatPrice>) -> 
 }
 
 /// §8.2: address, BIP21 and the mainnet caveat, as a photo caption.
-pub fn receive(network: Network, info: &AddressInfo) -> String {
+/// `mempool_visible` rather than a network check: the real question is whether
+/// this backend can see unconfirmed transactions, and that is a capability,
+/// not a chain. `balance` already takes it as data; this was the last card
+/// asking "is it mainnet?" when it meant "can we see the mempool?".
+pub fn receive(network: Network, info: &AddressInfo, mempool_visible: bool) -> String {
     let mut out = format!(
         "{}\n\n<b>Your address</b>\n<code>{}</code>\n\nUnused address #{}",
         badge(network),
@@ -651,7 +706,7 @@ pub fn receive(network: Network, info: &AddressInfo) -> String {
         info.index
     );
 
-    if network == Network::Bitcoin {
+    if !mempool_visible {
         out.push_str(
             "\n\nℹ️ A payment here shows up once it's in a block. Until then it won't \
              appear in /balance, even though it's on its way.",
@@ -728,15 +783,14 @@ pub fn history(network: Network, page: &Paged<TxSummary>) -> String {
         pager(page.page, page.total_pages())
     );
 
-    // On mainnet a txid is worth linking; on regtest there is nothing to link to.
-    if network == Network::Bitcoin {
+    // Worth linking wherever an explorer exists; on regtest there is nothing
+    // to link to, because nobody else can see that chain.
+    if explorer_base(network).is_some() {
         out.push_str("\n\n");
         for tx in &page.items {
-            out.push_str(&format!(
-                "<a href=\"https://mempool.space/tx/{0}\">{1}</a>  ",
-                tx.txid,
-                shorten(&tx.txid.to_string())
-            ));
+            let id = tx.txid.to_string();
+            out.push_str(&tx_link(network, &id, &shorten(&id)));
+            out.push_str("  ");
         }
     }
 
@@ -779,11 +833,10 @@ pub fn tx_detail(network: Network, d: &TxDetail, price: Option<&FiatPrice>) -> S
         out.push_str(&format!("\n<code>Today   {}</code>", usd(s.amount, price)));
     }
 
-    if network == Network::Bitcoin {
-        out.push_str(&format!(
-            "\n\n<a href=\"https://mempool.space/tx/{}\">See it on mempool.space</a>",
-            s.txid
-        ));
+    let link = tx_link(network, &s.txid.to_string(), "See it on mempool.space");
+    if !link.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(&link);
     }
 
     out
@@ -990,6 +1043,75 @@ mod onchain_tests {
 
         assert!(history(Network::Bitcoin, &page).contains("mempool.space"));
         assert!(!history(Network::Regtest, &page).contains("mempool.space"));
+
+        // Every public chain gets its own explorer path, and mainnet must not
+        // be sent to one of them — a careless edit to `explorer_base` would
+        // otherwise point real transactions at a test explorer.
+        let testnet4 = history(Network::Testnet4, &page);
+        assert!(
+            testnet4.contains("mempool.space/testnet4/tx/"),
+            "{testnet4}"
+        );
+        assert!(!history(Network::Bitcoin, &page).contains("/testnet4/"));
+    }
+
+    /// Every card leads with the badge, so a chain the badge does not know
+    /// makes the whole UI read UNKNOWN. That is what a `_` arm bought here
+    /// before `Testnet4` was added, and the HTML fixture would never have
+    /// caught it: `❔ UNKNOWN` is perfectly valid HTML.
+    #[test]
+    fn no_chain_badges_as_unknown() {
+        for network in [
+            Network::Bitcoin,
+            Network::Regtest,
+            Network::Testnet,
+            Network::Testnet4,
+            Network::Signet,
+        ] {
+            let b = badge(network);
+            assert!(!b.contains("UNKNOWN"), "{network} badges as {b}");
+            assert!(!b.is_empty());
+        }
+    }
+
+    /// A public test chain must not be told it can mint its own blocks.
+    #[test]
+    fn only_regtest_is_told_it_can_mine() {
+        let regtest = network_card(Network::Regtest);
+        assert!(regtest.contains("/mine 101"));
+
+        for network in [Network::Testnet4, Network::Testnet, Network::Signet] {
+            let card = network_card(network);
+            assert!(
+                !card.contains("/mine 101"),
+                "{network} cannot mine, but its card says it can:\n{card}"
+            );
+            assert!(
+                card.contains("faucet"),
+                "{network} should say where coins come from"
+            );
+        }
+
+        assert!(!network_card(Network::Bitcoin).contains("/mine"));
+    }
+
+    /// Regtest is the one chain with nowhere to link to, and the `Option` is
+    /// what keeps that a decision rather than an accident.
+    #[test]
+    fn only_a_private_chain_has_no_explorer() {
+        assert_eq!(explorer_base(Network::Regtest), None);
+        for network in [
+            Network::Bitcoin,
+            Network::Testnet,
+            Network::Testnet4,
+            Network::Signet,
+        ] {
+            assert!(
+                explorer_base(network).is_some(),
+                "{network} has an explorer"
+            );
+        }
+        assert_eq!(tx_link(Network::Regtest, "abc", "see it"), "");
     }
 
     #[test]
@@ -1044,8 +1166,8 @@ mod onchain_tests {
             received: Amount::ZERO,
             bip21: "bitcoin:bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu".into(),
         };
-        assert!(receive(Network::Bitcoin, &info).contains("in a block"));
-        assert!(!receive(Network::Regtest, &info).contains("in a block"));
+        assert!(receive(Network::Bitcoin, &info, false).contains("in a block"));
+        assert!(!receive(Network::Regtest, &info, true).contains("in a block"));
     }
 
     #[test]
@@ -1337,10 +1459,10 @@ pub fn broadcast_done(network: Network, b: &Broadcast, price: Option<&FiatPrice>
         "\n\n<code>/tx {txid}</code>\n<code>/bumpfee {txid}</code>"
     ));
 
-    if network == Network::Bitcoin {
-        out.push_str(&format!(
-            "\n\n<a href=\"https://mempool.space/tx/{txid}\">See it on mempool.space</a>"
-        ));
+    let link = tx_link(network, &txid, "See it on mempool.space");
+    if !link.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(&link);
     }
 
     out
@@ -2240,7 +2362,10 @@ mod html_tests {
                 received: Amount::ZERO,
                 bip21: "bitcoin:bc1qexample".into(),
             };
-            assert_sendable("receive", &receive(network, &info));
+            // Both shapes: a backend that can see the mempool and one that
+            // cannot, since the caveat is the only difference.
+            assert_sendable("receive/mempool", &receive(network, &info, true));
+            assert_sendable("receive/no mempool", &receive(network, &info, false));
             assert_sendable(
                 "addresses",
                 &addresses(

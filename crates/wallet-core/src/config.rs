@@ -31,14 +31,6 @@ impl NetworkChoice {
             NetworkChoice::Mainnet => "bitcoin",
         }
     }
-
-    /// What `getblockchaininfo.chain` must report for this choice.
-    pub fn expected_chain(self) -> &'static str {
-        match self {
-            NetworkChoice::Regtest => "regtest",
-            NetworkChoice::Mainnet => "main",
-        }
-    }
 }
 
 impl FromStr for NetworkChoice {

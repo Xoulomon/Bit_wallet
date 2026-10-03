@@ -161,7 +161,10 @@ impl ChainSource {
         if info.chain != self.network {
             return Err(CoreError::NetworkMismatch {
                 configured: self.network,
-                backend: chain_name(info.chain).to_string(),
+                // Core's own spelling, from the bitcoin crate's table rather
+                // than a hand-kept copy that answered "unknown" for
+                // anything it had not been told about.
+                backend: info.chain.to_core_arg().to_string(),
             });
         }
 
@@ -179,18 +182,6 @@ pub struct Health {
     pub tip_height: u32,
     pub tip_hash: bdk_wallet::bitcoin::BlockHash,
     pub latency: std::time::Duration,
-}
-
-/// `getblockchaininfo.chain` as Core spells it (BIP70 names), for the mismatch
-/// message. `Network`'s own `Display` says "bitcoin", Core says "main".
-pub fn chain_name(n: Network) -> &'static str {
-    match n {
-        Network::Bitcoin => "main",
-        Network::Testnet => "test",
-        Network::Signet => "signet",
-        Network::Regtest => "regtest",
-        _ => "unknown",
-    }
 }
 
 /// Turn a `bitcoincore_rpc` failure into a typed `BackendError`.

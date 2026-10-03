@@ -60,7 +60,7 @@ pub async fn receive(bot: Bot, msg: Message, ctx: Ctx) -> Result<()> {
         Err(e) => return crate::handlers::reply_error(&bot, &msg, &e).await,
     };
 
-    let caption = ui::receive(ctx.core.network(), &info);
+    let caption = ui::receive(ctx.core.network(), &info, ctx.core.capabilities().mempool);
 
     // A QR is the whole reason this command exists on a phone. If rendering it
     // fails, the address still has to arrive — as text rather than not at all.
