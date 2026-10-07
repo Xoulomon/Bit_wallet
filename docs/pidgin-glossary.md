@@ -182,6 +182,7 @@ chosen here becomes the assertion.
 |---|---|---|---|---|---|
 | `ui::incoming#1` | 📥 Incoming {a} — unconfirmed | 📥 {a} dey enter — e never confirm | `{a}`, 📥 | OK | |
 | `ui::incoming#2` | 📥 Received {a} — ✅ {n} conf | 📥 You don receive {a} — ✅ {n} conf | `{a}`, `{n}`, 📥, ✅ | OK | |
+| `ui::incoming_many#1` | 📥 Received {n} payments — {a} /history lists them; /balance has the total. | 📥 You don receive {n} payments — {a} /history go list dem; /balance get di total. | `{n}`, `{a}`, `/history`, `/balance`, 📥 | ?? | grouped line for one sync pass |
 | `ui::confirmed#1` | ✅ {id} — {n} confs | ✅ {id} — {n} confs | `{id}`, `{n}`, ✅ | OK | |
 | `ui::confirmed_many#1` | ✅ {n} transactions confirmed. /history lists them; /balance has the total. | ✅ {n} transaction don confirm. /history go list dem; /balance get di total. | `{n}`, `/history`, `/balance`, ✅ | OK | |
 | `ui::session_expired#1` | 🔒 Session locked after inactivity. | 🔒 Session don lock becos you no do anything for a while. | 🔒 | OK | |

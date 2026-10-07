@@ -891,6 +891,19 @@ pub fn incoming(amount: Amount, status: TxStatus, price: Option<&FiatPrice>) -> 
     out
 }
 
+/// A whole wallet's history arriving at once, collapsed. The first sync of a
+/// restored wallet — or of a regtest chain `/mine 101` just filled — finds
+/// every payment it ever received in a single pass, and announcing them one by
+/// one buries the only two numbers anyone wants: how many, and how much.
+pub fn incoming_many(count: usize, total: Amount, price: Option<&FiatPrice>) -> String {
+    let mut out = format!("📥 Received {count} payments — {}", sats(total));
+    if let Some(price) = price {
+        out.push_str(&format!("\n{}", usd(total, price)));
+    }
+    out.push_str("\n\n/history lists them; /balance has the total.");
+    out
+}
+
 pub fn confirmed(txid: &str, confirmations: u32) -> String {
     // Short in the sentence so it reads, whole in a code block so it is usable.
     format!(
@@ -1187,6 +1200,18 @@ mod onchain_tests {
             .contains("Received")
         );
         assert!(confirmed(&txid(3).to_string(), 6).contains("6 confs"));
+    }
+
+    /// The whole point of the grouped line: a sync that finds a hundred
+    /// payments says how many and how much, and nothing per transaction.
+    #[test]
+    fn a_burst_of_arrivals_collapses_to_a_count_and_a_total() {
+        let text = incoming_many(101, Amount::from_sat(246_582_006), None);
+        assert!(text.contains("101 payments"));
+        assert!(text.contains("246,582,006 sats"));
+        assert!(text.contains("/history"));
+        // One line of numbers, then the pointer — not a line per payment.
+        assert!(text.lines().filter(|l| l.contains("sats")).count() == 1);
     }
 }
 
@@ -2543,6 +2568,10 @@ mod html_tests {
         assert_sendable(
             "incoming",
             &incoming(Amount::from_sat(1), TxStatus::Unconfirmed, None),
+        );
+        assert_sendable(
+            "incoming_many",
+            &incoming_many(101, Amount::from_sat(246_582_006), None),
         );
         assert_sendable("session_expired", &session_expired());
         assert_sendable("backend_degraded", &backend_degraded());
