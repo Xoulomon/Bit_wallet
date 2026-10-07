@@ -154,6 +154,164 @@ pub fn welcome(network: Network, has_wallet: bool) -> String {
     }
 }
 
+/// A command a button can stand in for (§8.2, §8.5).
+///
+/// Every variant is a command that takes no argument, which is the whole
+/// entry rule: a tap carries intent and nothing else, so `cmd:<slug>:-` is
+/// the complete instruction and the handler needs nothing from the card the
+/// button was drawn on. That is what lets a button and the typed command run
+/// the *same* function rather than two that look alike.
+///
+/// Absent, deliberately:
+/// * `/tx`, `/bumpfee`, `/pj_receive`, `/mine` — each needs an argument a
+///   button cannot supply, and a button that opens a prompt for one is a
+///   different flow from the command, not the same one.
+/// * `/export` and `/delete` — §8.1 already rules that a destructive action
+///   takes a typed word rather than a button press. The command that *starts*
+///   one is the same question, so both stay typed-only.
+///
+/// `Send` is here because bare `/send` has its own well-defined behaviour —
+/// it prints the usage card — and that is exactly what the button does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuCommand {
+    Create,
+    Restore,
+    Unlock,
+    Lock,
+    Balance,
+    Receive,
+    Send,
+    History,
+    Addresses,
+    PjSessions,
+    Faucet,
+    Status,
+    Network,
+    Help,
+}
+
+/// Every variant, so the round-trip test and the keyboard cannot disagree
+/// about what exists.
+const MENU_COMMANDS: [MenuCommand; 14] = [
+    MenuCommand::Create,
+    MenuCommand::Restore,
+    MenuCommand::Unlock,
+    MenuCommand::Lock,
+    MenuCommand::Balance,
+    MenuCommand::Receive,
+    MenuCommand::Send,
+    MenuCommand::History,
+    MenuCommand::Addresses,
+    MenuCommand::PjSessions,
+    MenuCommand::Faucet,
+    MenuCommand::Status,
+    MenuCommand::Network,
+    MenuCommand::Help,
+];
+
+impl MenuCommand {
+    /// The slug carried in the callback data.
+    ///
+    /// It is the command's own name, so a log line, a callback payload and the
+    /// thing a user could have typed instead all read the same.
+    pub fn slug(self) -> &'static str {
+        match self {
+            MenuCommand::Create => "create",
+            MenuCommand::Restore => "restore",
+            MenuCommand::Unlock => "unlock",
+            MenuCommand::Lock => "lock",
+            MenuCommand::Balance => "balance",
+            MenuCommand::Receive => "receive",
+            MenuCommand::Send => "send",
+            MenuCommand::History => "history",
+            MenuCommand::Addresses => "addresses",
+            MenuCommand::PjSessions => "pj_sessions",
+            MenuCommand::Faucet => "faucet",
+            MenuCommand::Status => "status",
+            MenuCommand::Network => "network",
+            MenuCommand::Help => "help",
+        }
+    }
+
+    /// `None` for anything this build does not recognise — an older card in an
+    /// older chat can outlive the button it carries.
+    pub fn from_slug(slug: &str) -> Option<MenuCommand> {
+        MENU_COMMANDS.into_iter().find(|c| c.slug() == slug)
+    }
+
+    /// What the button says. The cards keep listing the commands in text, so
+    /// the menu is a shortcut for someone who knows them and a hint for
+    /// someone who does not — it never has to be the only way in.
+    fn label(self) -> &'static str {
+        match self {
+            MenuCommand::Create => "🆕 Create wallet",
+            MenuCommand::Restore => "♻️ Restore wallet",
+            MenuCommand::Unlock => "🔓 Unlock",
+            MenuCommand::Lock => "🔒 Lock",
+            MenuCommand::Balance => "💰 Balance",
+            MenuCommand::Receive => "📥 Receive",
+            MenuCommand::Send => "📤 Send",
+            MenuCommand::History => "📜 History",
+            MenuCommand::Addresses => "🏷 Addresses",
+            MenuCommand::PjSessions => "🤝 Payjoin",
+            MenuCommand::Faucet => "🚰 Faucet",
+            MenuCommand::Status => "📡 Status",
+            MenuCommand::Network => "🌐 Network",
+            MenuCommand::Help => "❓ Help",
+        }
+    }
+
+    /// §8.5: `action:subject:arg`. The arg is always `-`, because a command
+    /// that needed one could not be on this menu in the first place.
+    pub fn callback_data(self) -> String {
+        format!("{}{}:-", MENU_PREFIX, self.slug())
+    }
+}
+
+/// The routing prefix of §8.5, in one place so the dispatcher and the buttons
+/// cannot disagree about it.
+pub const MENU_PREFIX: &str = "cmd:";
+
+/// The menu that goes under the `/start` and `/help` cards.
+///
+/// What it offers depends on the wallet and the chain, for the same reason
+/// [`network_card`] is exhaustive: a button core will refuse is worse than no
+/// button, because the user has no way to tell which it was.
+pub fn menu_keyboard(network: Network, has_wallet: bool) -> InlineKeyboardMarkup {
+    let rows: Vec<Vec<MenuCommand>> = if has_wallet {
+        let mut rows = vec![
+            vec![MenuCommand::Balance, MenuCommand::Receive],
+            vec![MenuCommand::Send, MenuCommand::History],
+            vec![MenuCommand::Addresses, MenuCommand::PjSessions],
+            // Both, always. Which one applies depends on a session that can
+            // expire while the card sits in the chat, and a keyboard drawn
+            // from state goes stale silently — one of the two buttons simply
+            // stops being there when it is the one you want.
+            vec![MenuCommand::Unlock, MenuCommand::Lock],
+        ];
+        if network == Network::Regtest {
+            rows.push(vec![MenuCommand::Faucet]);
+        }
+        rows.push(vec![MenuCommand::Status, MenuCommand::Network]);
+        rows.push(vec![MenuCommand::Help]);
+        rows
+    } else {
+        // No /balance, no /receive: there is nothing to show yet, and core
+        // would answer every one of them with NoWallet.
+        vec![
+            vec![MenuCommand::Create, MenuCommand::Restore],
+            vec![MenuCommand::Status, MenuCommand::Network],
+            vec![MenuCommand::Help],
+        ]
+    };
+
+    InlineKeyboardMarkup::new(rows.into_iter().map(|row| {
+        row.into_iter()
+            .map(|c| InlineKeyboardButton::callback(c.label(), c.callback_data()))
+            .collect::<Vec<_>>()
+    }))
+}
+
 /// `/status` (§8.2). The call budget appears only where there is one to spend.
 ///
 /// The price row is always drawn, including when there is no price. A missing
@@ -539,6 +697,114 @@ mod tests {
     fn every_error_renders_to_a_sentence_with_a_next_step() {
         let rendered = render_error(&CoreError::Locked);
         assert!(rendered.contains("/unlock"));
+    }
+
+    /// Every slug the keyboard can draw is one `from_slug` reads back.
+    ///
+    /// This is the join between the two halves of the feature: the button is
+    /// rendered here and routed in `handlers::menu`, and a slug that only one
+    /// side knows is a button that does nothing when it is tapped.
+    #[test]
+    fn menu_slugs_round_trip() {
+        for command in MENU_COMMANDS {
+            assert_eq!(
+                MenuCommand::from_slug(command.slug()),
+                Some(command),
+                "`{}` is drawn on a button but routes to nothing",
+                command.slug()
+            );
+        }
+        assert_eq!(MenuCommand::from_slug("nonsense"), None);
+    }
+
+    /// The slugs are the command names, which is the property that lets a
+    /// reader of `cmd:balance:-` know what was tapped without a lookup table.
+    #[test]
+    fn a_menu_slug_is_the_command_it_runs() {
+        assert_eq!(MenuCommand::Balance.slug(), "balance");
+        // The underscored one specifically: a rename rule mangling it is
+        // exactly how /pj_receive once became an update nothing handled.
+        assert_eq!(MenuCommand::PjSessions.slug(), "pj_sessions");
+    }
+
+    /// §8.5 again, for the menu: the data is a command name and nothing else,
+    /// so a replayed tap can only re-run something the user could type.
+    #[test]
+    fn menu_callback_data_is_a_command_and_an_empty_argument() {
+        for command in MENU_COMMANDS {
+            let data = command.callback_data();
+            assert!(data.starts_with(MENU_PREFIX));
+            assert!(data.ends_with(":-"), "{data} should carry no argument");
+            assert!(
+                data.len() <= 64,
+                "Telegram's callback data limit is 64 bytes"
+            );
+        }
+    }
+
+    /// A button core would refuse is worse than no button: the user cannot
+    /// tell a chain that has no faucet from a bot that is broken.
+    #[test]
+    fn the_faucet_button_appears_only_where_there_is_a_faucet() {
+        assert!(menu_has(Network::Regtest, true, MenuCommand::Faucet));
+        for chain in [
+            Network::Bitcoin,
+            Network::Testnet,
+            Network::Testnet4,
+            Network::Signet,
+        ] {
+            assert!(
+                !menu_has(chain, true, MenuCommand::Faucet),
+                "{chain} has no /faucet, so it must not be offered one"
+            );
+        }
+    }
+
+    /// Before a wallet exists the only useful commands are the two that make
+    /// one; /balance would answer NoWallet and teach the user nothing.
+    #[test]
+    fn the_menu_before_a_wallet_offers_only_what_works_without_one() {
+        assert!(menu_has(Network::Regtest, false, MenuCommand::Create));
+        assert!(menu_has(Network::Regtest, false, MenuCommand::Restore));
+        assert!(!menu_has(Network::Regtest, false, MenuCommand::Balance));
+        assert!(!menu_has(Network::Regtest, false, MenuCommand::Send));
+
+        // And once there is one, /create is not on offer — core refuses it.
+        assert!(!menu_has(Network::Regtest, true, MenuCommand::Create));
+        assert!(menu_has(Network::Regtest, true, MenuCommand::Balance));
+    }
+
+    /// §8.1: a destructive action takes a typed word. Neither of the two
+    /// commands that start one may be reachable by a tap.
+    #[test]
+    fn nothing_destructive_is_one_tap_away() {
+        for has_wallet in [true, false] {
+            for chain in [Network::Bitcoin, Network::Regtest] {
+                let data = menu_data(chain, has_wallet);
+                for forbidden in ["export", "delete", "mine"] {
+                    assert!(
+                        !data.iter().any(|d| d.contains(forbidden)),
+                        "/{forbidden} must stay a typed command"
+                    );
+                }
+            }
+        }
+    }
+
+    fn menu_data(network: Network, has_wallet: bool) -> Vec<String> {
+        menu_keyboard(network, has_wallet)
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .filter_map(|b| match &b.kind {
+                teloxide::types::InlineKeyboardButtonKind::CallbackData(d) => Some(d.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn menu_has(network: Network, has_wallet: bool, command: MenuCommand) -> bool {
+        menu_data(network, has_wallet).contains(&command.callback_data())
     }
 }
 

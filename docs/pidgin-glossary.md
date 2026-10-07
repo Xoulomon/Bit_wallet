@@ -82,6 +82,34 @@ would cost comprehension and buy nothing.
 | `ui::network_card#6` | `/mine 101` mints blocks (admins only). | `/mine 101` dey make block (na admin only). | `/mine 101`, `<code>` | OK | |
 | `ui::network_card#7` | State for each network is stored separately; the two can never mix. | Each network get im own separate state; di two no fit mix at all. | | OK | |
 
+### The inline menu — `ui::menu_keyboard`
+
+The buttons under the `/start` and `/help` cards. Each one runs the command of the
+same name, so the label is a **name for the command**, not a sentence: `💰 Balance`
+is the button for `/balance`. Translating a label changes nothing the bot parses —
+the callback data carries the English slug (`cmd:balance:-`) and never the label —
+so these are free to read naturally in Pidgin.
+
+**Budget: ~14 characters.** They render two-across on a phone, so a label much
+longer than `♻️ Restore wallet` wraps or truncates.
+
+| ID | English | Pidgin | Must keep | Conf | Notes / your corrections |
+|---|---|---|---|---|---|
+| `btn::menu_create` | 🆕 Create wallet | 🆕 New wallet | 🆕 | ?? | runs `/create` |
+| `btn::menu_restore` | ♻️ Restore wallet | ♻️ Bring wallet back | ♻️ | XX | runs `/restore`; "Bring wallet back" may be too long — alternative: `♻️ Restore` |
+| `btn::menu_unlock` | 🔓 Unlock | 🔓 Open am | 🔓 | ?? | runs `/unlock` |
+| `btn::menu_lock` | 🔒 Lock | 🔒 Lock am | 🔒 | ?? | runs `/lock` |
+| `btn::menu_balance` | 💰 Balance | 💰 Balance | 💰 | OK | runs `/balance`; technical noun stays English |
+| `btn::menu_receive` | 📥 Receive | 📥 Collect | 📥 | ?? | runs `/receive` |
+| `btn::menu_send` | 📤 Send | 📤 Send | 📤 | OK | runs `/send` — shows the usage card, since a button carries no address |
+| `btn::menu_history` | 📜 History | 📜 History | 📜 | ?? | runs `/history` |
+| `btn::menu_addresses` | 🏷 Addresses | 🏷 Addresses | 🏷 | OK | runs `/addresses`; technical noun stays English |
+| `btn::menu_payjoin` | 🤝 Payjoin | 🤝 Payjoin | 🤝 | OK | runs `/pj_sessions`; technical noun stays English |
+| `btn::menu_faucet` | 🚰 Faucet | 🚰 Faucet | 🚰 | ?? | runs `/faucet`; regtest only |
+| `btn::menu_status` | 📡 Status | 📡 Status | 📡 | OK | runs `/status`; technical noun stays English |
+| `btn::menu_network` | 🌐 Network | 🌐 Network | 🌐 | OK | runs `/network`; technical noun stays English |
+| `btn::menu_help` | ❓ Help | ❓ Help | ❓ | OK | runs `/help` |
+
 ## 2. Errors — `ui::render_error`
 
 The most important table in the file: these are what a user reads when something has
@@ -226,7 +254,7 @@ chosen here becomes the assertion.
 | `btn::cancel` | ✖ Cancel | ✖ Cancel | ✖ | OK | button |
 | `btn::custom_fee` | Custom sat/vB | My own sat/vB | | ?? | button |
 | `btn::min_rate` | At least {n} sat/vB | At least {n} sat/vB | `{n}` | OK | button |
-| `btn::refresh` | 🔄 Refresh | 🔄 Refresh | 🔄 | OK | button, `onchain.rs:109,145` |
+| `btn::refresh` | 🔄 Refresh | 🔄 Refresh | 🔄 | OK | button, `onchain::refresh_keyboard` |
 | `btn::pj_cancel` | ✖ Cancel {id} | ✖ Cancel {id} | `{id}`, ✖ | OK | button, `payjoin.rs:141` |
 
 ## 7. Faucet and mining

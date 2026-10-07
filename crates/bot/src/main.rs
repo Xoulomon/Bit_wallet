@@ -155,11 +155,18 @@ fn schema() -> teloxide::dispatching::UpdateHandler<anyhow::Error> {
     // core minted — so a replayed button can only reference something core will
     // re-validate or reject.
     let callbacks = Update::filter_callback_query()
+        // §8.7, for taps as well as for messages. A button can now run a
+        // command, so the gate that covers typing one has to cover tapping it.
+        .branch(dptree::filter_map(guard_callback).endpoint(refuse_tap))
         .branch(
             dptree::filter(|q: CallbackQuery| q.data.as_deref() == Some("bal:refresh"))
                 .endpoint(handlers::onchain::refresh_balance),
         )
         .enter_dialogue::<CallbackQuery, SqliteDialogueStore, State>()
+        // The inline menu (§8.2): every button here runs the same function the
+        // typed command runs. It is inside the dialogue so /create and /unlock
+        // can open their flows from a tap.
+        .branch(dptree::filter(starts_with(ui::MENU_PREFIX)).endpoint(handlers::menu::tap))
         .branch(
             dptree::filter(starts_with("send:fee:"))
                 .branch(case![State::AwaitFeeChoice { what }].endpoint(handlers::send::choose_fee)),
@@ -202,6 +209,35 @@ fn guard(msg: Message, ctx: Ctx) -> Option<auth::Refusal> {
 
 async fn refuse(bot: Bot, msg: Message, refusal: auth::Refusal) -> Result<()> {
     bot.send_message(msg.chat.id, refusal.message()).await?;
+    Ok(())
+}
+
+/// [`guard`] for a tap. Same policy, different update: a callback carries its
+/// own sender and its own throttle slot.
+fn guard_callback(query: CallbackQuery, ctx: Ctx) -> Option<auth::Refusal> {
+    if let Err(refusal) = auth::check_callback(&query, &ctx.policy) {
+        return Some(refusal);
+    }
+    #[allow(clippy::cast_possible_wrap)]
+    if !ctx.throttle.allow(query.from.id.0 as i64) {
+        return Some(auth::Refusal::TooFast);
+    }
+    None
+}
+
+/// An alert on the button rather than a message in the chat.
+///
+/// The refusal belongs to the tap, and in the one case that matters — a card
+/// forwarded into a group — the chat it would be posted in is the group the tap
+/// is being refused for.
+async fn refuse_tap(bot: Bot, query: CallbackQuery, refusal: auth::Refusal) -> Result<()> {
+    // Telegram caps an alert at 200 characters and rejects a longer one, which
+    // would turn a refusal into a dispatcher error and no answer at all.
+    let text: String = refusal.message().chars().take(200).collect();
+    bot.answer_callback_query(query.id)
+        .text(text)
+        .show_alert(true)
+        .await?;
     Ok(())
 }
 

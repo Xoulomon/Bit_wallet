@@ -27,6 +27,18 @@ fn user_of(msg: &Message, ctx: &Ctx) -> Result<UserId> {
     ctx.users.resolve(from.id.0 as i64)
 }
 
+/// What bare `/send` does: say what the command takes.
+///
+/// A payment needs a destination, and a destination is not something a button
+/// can carry (§8.5), so the inline Send button lands here — the same place the
+/// typed command with no argument lands.
+pub async fn show_usage(bot: &Bot, chat: ChatId, ctx: &Ctx) -> Result<()> {
+    bot.send_message(chat, ui::send_usage(ctx.core.network()))
+        .parse_mode(ParseMode::Html)
+        .await?;
+    Ok(())
+}
+
 /// `/send <addr|bip21> [amount|max]` (§8.3 step 1).
 pub async fn send(
     bot: Bot,
@@ -39,10 +51,7 @@ pub async fn send(
     let mut parts = args.split_whitespace();
 
     let Some(target_arg) = parts.next() else {
-        bot.send_message(msg.chat.id, ui::send_usage(network))
-            .parse_mode(ParseMode::Html)
-            .await?;
-        return Ok(());
+        return show_usage(&bot, msg.chat.id, &ctx).await;
     };
 
     let target = match ctx.core.parse_payment(target_arg) {

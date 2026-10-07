@@ -153,6 +153,24 @@ file refuses to load under the wrong chain.
 
 `wallet-cli` offers the same set; run it with no arguments for its usage.
 
+### The inline menu
+
+`/start` and `/help` come with a keyboard of buttons under them, and a button runs
+the command it is named after — the same function, not a copy of it, so the two
+cannot answer differently. What the keyboard offers depends on the wallet and the
+chain: `/create` and `/restore` before there is a wallet, the rest after, and
+`/faucet` only on regtest.
+
+Six commands have no button, each for a reason:
+
+| Command | Why it stays typed |
+|---|---|
+| `/export` · `/delete` | A destructive action takes a typed word, not a thumb |
+| `/tx` · `/bumpfee` · `/pj_receive` · `/mine` | Each needs an argument, and callback data carries intent only |
+
+`/send` does have one: it shows the usage card, which is exactly what bare `/send`
+does, since a button cannot carry a destination.
+
 ---
 
 ## Architecture

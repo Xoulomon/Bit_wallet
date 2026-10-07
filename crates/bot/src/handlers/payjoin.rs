@@ -124,7 +124,10 @@ pub async fn open_session(
 
 pub async fn sessions(bot: Bot, msg: Message, ctx: Ctx) -> Result<()> {
     let user = user_of(&msg, &ctx)?;
+    show_sessions(&bot, msg.chat.id, &ctx, user).await
+}
 
+pub async fn show_sessions(bot: &Bot, chat: ChatId, ctx: &Ctx, user: UserId) -> Result<()> {
     match ctx.core.payjoin_sessions(user).await {
         Ok(list) => {
             let keyboard: Vec<Vec<InlineKeyboardButton>> = list
@@ -145,7 +148,7 @@ pub async fn sessions(bot: Bot, msg: Message, ctx: Ctx) -> Result<()> {
                 .collect();
 
             let mut message = bot
-                .send_message(msg.chat.id, ui::payjoin_sessions(ctx.core.network(), &list))
+                .send_message(chat, ui::payjoin_sessions(ctx.core.network(), &list))
                 .parse_mode(ParseMode::Html);
 
             if !keyboard.is_empty() {
@@ -153,7 +156,7 @@ pub async fn sessions(bot: Bot, msg: Message, ctx: Ctx) -> Result<()> {
             }
             message.await?;
         }
-        Err(e) => return crate::handlers::reply_error(&bot, &msg, &e).await,
+        Err(e) => return crate::handlers::reply_error_at(bot, chat, "/pj_sessions", &e).await,
     }
     Ok(())
 }

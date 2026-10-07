@@ -5,7 +5,7 @@
 //! is allowed to hold one.
 
 use std::collections::HashSet;
-use teloxide::types::{ChatId, Message, UserId as TgUserId};
+use teloxide::types::{CallbackQuery, ChatId, Message, UserId as TgUserId};
 
 #[derive(Debug, Clone)]
 pub struct Policy {
@@ -80,6 +80,30 @@ pub fn check(msg: &Message, policy: &Policy) -> Result<(TgUserId, ChatId), Refus
         return Err(Refusal::NotAllowed);
     }
     Ok((from.id, msg.chat.id))
+}
+
+/// The same gate for a button press (§8.7).
+///
+/// Buttons used to skip this entirely — only `Update::filter_message` was
+/// guarded — and that was survivable while every button was a step inside a
+/// flow a guarded command had already started. It stopped being survivable the
+/// moment a button could *run* a command: the allowlist and the throttle have
+/// to cover both ways in, or the second one is a way around the first.
+///
+/// `message` is an `Option` because Telegram drops it once the card is old
+/// enough, so the chat can only be checked when it is there. The sender always
+/// is, and the sender is what the allowlist is about.
+pub fn check_callback(query: &CallbackQuery, policy: &Policy) -> Result<TgUserId, Refusal> {
+    if let Some(message) = query.message.as_ref()
+        && !message.chat().is_private()
+    {
+        return Err(Refusal::NotPrivate);
+    }
+    #[allow(clippy::cast_possible_wrap)]
+    if !policy.is_allowed(query.from.id.0 as i64) {
+        return Err(Refusal::NotAllowed);
+    }
+    Ok(query.from.id)
 }
 
 #[cfg(test)]

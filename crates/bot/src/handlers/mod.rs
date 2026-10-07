@@ -4,27 +4,52 @@
 //! bitcoin logic is a bug in the layering, not a shortcut.
 
 pub mod admin;
+pub mod menu;
 pub mod onchain;
 pub mod payjoin;
 pub mod send;
 pub mod start;
 pub mod wallet;
 
+use crate::Ctx;
 use anyhow::Result;
 use teloxide::{prelude::*, types::ParseMode};
+
+/// The Telegram id → the opaque `UserId` core understands (§3a rule 3).
+///
+/// Infallible in practice: §8.7's guard rejects an authorless update before any
+/// handler runs, so by the time one of these is called `from` is always there.
+/// The error arm is here because "always" is a property of the dispatcher, not
+/// of the type.
+pub fn user_of(msg: &Message, ctx: &Ctx) -> Result<wallet_core::types::UserId> {
+    let from = msg
+        .from
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("a private message always has a sender"))?;
+    #[allow(clippy::cast_possible_wrap)]
+    ctx.users.resolve(from.id.0 as i64)
+}
 
 /// One place turns a `CoreError` into a reply, so no handler has to remember
 /// the parse mode or the rendering rule (§8.1).
 pub async fn reply_error(bot: &Bot, msg: &Message, e: &wallet_core::CoreError) -> Result<()> {
-    // Log it too. An error the user sees but the operator cannot find is one
-    // nobody can diagnose — which is how a /bumpfee refusal spent a day
-    // looking like a server fault.
-    tracing::warn!(
-        command = msg.text().unwrap_or_default(),
-        error = %e,
-        "replied with an error"
-    );
-    bot.send_message(msg.chat.id, crate::ui::render_error(e))
+    reply_error_at(bot, msg.chat.id, msg.text().unwrap_or_default(), e).await
+}
+
+/// The same, where the action came from a tap rather than a message.
+///
+/// A button carries no text to quote, so the caller names the command it was
+/// standing in for. That keeps the log field meaningful either way: an error
+/// the user sees but the operator cannot find is one nobody can diagnose —
+/// which is how a /bumpfee refusal spent a day looking like a server fault.
+pub async fn reply_error_at(
+    bot: &Bot,
+    chat: ChatId,
+    command: &str,
+    e: &wallet_core::CoreError,
+) -> Result<()> {
+    tracing::warn!(command, error = %e, "replied with an error");
+    bot.send_message(chat, crate::ui::render_error(e))
         .parse_mode(ParseMode::Html)
         .await?;
     Ok(())
