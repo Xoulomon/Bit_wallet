@@ -213,12 +213,66 @@ pub async fn show_history(
 ) -> Result<()> {
     match ctx.core.history(user, page).await {
         Ok(listing) => {
-            bot.send_message(chat, ui::history(ctx.core.network(), &listing))
+            let mut card = bot
+                .send_message(chat, ui::history(ctx.core.network(), &listing))
                 .parse_mode(ParseMode::Html)
-                .link_preview_options(no_preview())
-                .await?;
+                .link_preview_options(no_preview());
+
+            // Only where there is somewhere to go. A single page gets no row.
+            if let Some(keyboard) = ui::history_keyboard(&listing) {
+                card = card.reply_markup(keyboard);
+            }
+            card.await?;
         }
         Err(e) => return crate::handlers::reply_error_at(bot, chat, "/history", &e).await,
+    }
+    Ok(())
+}
+
+/// The Previous and Next buttons of `/history` (§8.2).
+///
+/// Edits the card in place rather than posting another one (§8.1): paging
+/// through six screens of history should leave one message behind, not six.
+pub async fn turn_history_page(bot: Bot, query: CallbackQuery, ctx: Ctx) -> Result<()> {
+    bot.answer_callback_query(query.id.clone()).await?;
+
+    let Some(message) = query.message.as_ref() else {
+        return Ok(());
+    };
+    let Some(index) = query.data.as_deref().and_then(ui::history_page_from_data) else {
+        tracing::warn!(data = ?query.data, "a history button carried no page number");
+        return Ok(());
+    };
+
+    #[allow(clippy::cast_possible_wrap)]
+    let user = ctx.users.resolve(query.from.id.0 as i64)?;
+    let chat = message.chat().id;
+
+    let listing = match ctx.core.history(user, Page::new(index)).await {
+        Ok(listing) => listing,
+        Err(e) => return crate::handlers::reply_error_at(&bot, chat, "/history", &e).await,
+    };
+
+    let edit = bot
+        .edit_message_text(
+            chat,
+            message.id(),
+            ui::history(ctx.core.network(), &listing),
+        )
+        .parse_mode(ParseMode::Html)
+        .link_preview_options(no_preview())
+        // Always, even when it is empty. An edit that omits the markup leaves
+        // the old one in place, so the last page would keep a Next button
+        // pointing past the end of the history.
+        .reply_markup(ui::history_keyboard(&listing).unwrap_or_default())
+        .await;
+
+    // The same card again — a tap on a page the screen is already showing.
+    // Nothing is wrong, so nothing is reported.
+    if let Err(e) = edit
+        && !is_unmodified(&e)
+    {
+        return Err(e.into());
     }
     Ok(())
 }

@@ -1019,10 +1019,7 @@ pub fn addresses(network: Network, page: &Paged<AddressInfo>) -> String {
 
 pub fn history(network: Network, page: &Paged<TxSummary>) -> String {
     if page.items.is_empty() {
-        return format!(
-            "{}\n\nNo transactions yet. /receive gives you an address to be paid at.",
-            badge(network)
-        );
+        return empty_history(network, page);
     }
 
     let mut table = Table::new();
@@ -1064,6 +1061,74 @@ pub fn history(network: Network, page: &Paged<TxSummary>) -> String {
 }
 
 /// §8.2: one transaction in detail.
+/// Two different nothings.
+///
+/// A wallet with no transactions at all, and a page past the end of one that
+/// has them. `/history 99` has always answered both with "No transactions yet",
+/// which is a lie in the second case — and the Next button is what turns that
+/// from a typo nobody makes into a thumb away.
+fn empty_history(network: Network, page: &Paged<TxSummary>) -> String {
+    if page.total == 0 {
+        return format!(
+            "{}\n\nNo transactions yet. /receive gives you an address to be paid at.",
+            badge(network)
+        );
+    }
+
+    let pages = match page.total_pages() {
+        1 => "one page".to_string(),
+        n => format!("{n} pages"),
+    };
+    format!(
+        "{}\n\nThat page is past the end — your history has {pages}. \
+         /history goes back to the first.",
+        badge(network)
+    )
+}
+
+/// Previous and Next for `/history` (§8.2).
+///
+/// `None` where there is nothing to navigate: one page needs no buttons, and a
+/// keyboard whose every button is absent is worse than no keyboard, because the
+/// card grows a row that does nothing.
+///
+/// The data carries a page index, which is not an id core minted — the one
+/// exception §8.5 allows itself, for the same reason `send:fee:` carries a
+/// label. An index is a read offset. It names no amount and no address, core
+/// re-reads the page under it, and replaying one can only show the user their
+/// own history again.
+pub fn history_keyboard(page: &Paged<TxSummary>) -> Option<InlineKeyboardMarkup> {
+    let mut row: Vec<InlineKeyboardButton> = Vec::with_capacity(2);
+
+    if page.has_prev() {
+        row.push(InlineKeyboardButton::callback(
+            "◀ Previous",
+            history_page_data(page.page.index - 1),
+        ));
+    }
+    if page.has_next() {
+        row.push(InlineKeyboardButton::callback(
+            "Next ▶",
+            history_page_data(page.page.index + 1),
+        ));
+    }
+
+    (!row.is_empty()).then(|| InlineKeyboardMarkup::new([row]))
+}
+
+/// The routing prefix of §8.5 for a page turn, in one place so the buttons and
+/// the dispatcher cannot disagree about it.
+pub const HISTORY_PAGE_PREFIX: &str = "hist:page:";
+
+fn history_page_data(index: u32) -> String {
+    format!("{HISTORY_PAGE_PREFIX}{index}")
+}
+
+/// The index a `hist:page:` tap asks for, or `None` for anything else.
+pub fn history_page_from_data(data: &str) -> Option<u32> {
+    data.strip_prefix(HISTORY_PAGE_PREFIX)?.parse().ok()
+}
+
 pub fn tx_detail(network: Network, d: &TxDetail, price: Option<&FiatPrice>) -> String {
     let s = &d.summary;
     let mut out = format!(
@@ -1408,6 +1473,137 @@ mod onchain_tests {
             total: 25,
         };
         assert_eq!(pager(many.page, many.total_pages()), "Page 2 of 3");
+    }
+
+    /// One row of history on each page, so a fixture can be any shape of
+    /// listing without carrying ten transactions around.
+    fn listing(index: u32, total: usize) -> Paged<TxSummary> {
+        Paged {
+            items: vec![TxSummary {
+                txid: txid(1),
+                direction: TxDirection::Incoming,
+                amount: Amount::from_sat(25_000),
+                fee: None,
+                status: TxStatus::Unconfirmed,
+                timestamp: None,
+            }],
+            page: Page::new(index),
+            total,
+        }
+    }
+
+    fn buttons(keyboard: &InlineKeyboardMarkup) -> Vec<(String, String)> {
+        keyboard
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .filter_map(|b| match &b.kind {
+                teloxide::types::InlineKeyboardButtonKind::CallbackData(d) => {
+                    Some((b.text.clone(), d.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The first page can only go forward, the last only back, and a middle
+    /// page both ways. Getting this wrong is a button that pages off the end.
+    #[test]
+    fn history_offers_only_the_pages_that_exist() {
+        // 25 transactions at ten a page is three pages: 0, 1, 2.
+        let first = history_keyboard(&listing(0, 25)).expect("more than one page");
+        assert_eq!(
+            buttons(&first),
+            vec![("Next ▶".to_string(), "hist:page:1".to_string())],
+            "the first page has nothing behind it"
+        );
+
+        let middle = history_keyboard(&listing(1, 25)).expect("more than one page");
+        assert_eq!(
+            buttons(&middle),
+            vec![
+                ("◀ Previous".to_string(), "hist:page:0".to_string()),
+                ("Next ▶".to_string(), "hist:page:2".to_string()),
+            ]
+        );
+
+        let last = history_keyboard(&listing(2, 25)).expect("more than one page");
+        assert_eq!(
+            buttons(&last),
+            vec![("◀ Previous".to_string(), "hist:page:1".to_string())],
+            "the last page must not offer a Next that pages off the end"
+        );
+    }
+
+    /// A row of no buttons is worse than no row: the card grows something that
+    /// does nothing.
+    #[test]
+    fn a_single_page_of_history_gets_no_buttons() {
+        assert!(history_keyboard(&listing(0, 1)).is_none());
+        assert!(history_keyboard(&listing(0, 10)).is_none());
+        // Eleven is two pages, and then there is somewhere to go.
+        assert!(history_keyboard(&listing(0, 11)).is_some());
+    }
+
+    /// The round trip the dispatcher depends on: what the button carries is
+    /// what the handler reads back out of it.
+    #[test]
+    fn a_page_button_round_trips_through_its_callback_data() {
+        for (_, data) in buttons(&history_keyboard(&listing(1, 25)).expect("two buttons")) {
+            assert!(history_page_from_data(&data).is_some(), "{data} parses");
+            assert!(
+                data.len() <= 64,
+                "Telegram's callback data limit is 64 bytes"
+            );
+        }
+        assert_eq!(history_page_from_data("hist:page:7"), Some(7));
+
+        // Nothing else is claimed, so this endpoint cannot swallow a tap that
+        // belongs to the send flow, to Refresh or to the menu.
+        for other in [
+            "hist:page:",
+            "hist:page:x",
+            "hist:page:-1",
+            "bal:refresh",
+            "cmd:history:-",
+            "send:confirm:01HXYZ",
+        ] {
+            assert_eq!(history_page_from_data(other), None, "{other}");
+        }
+    }
+
+    /// Two different nothings, and they used to read the same.
+    ///
+    /// `/history 99` on a wallet with transactions said "No transactions yet",
+    /// which is a lie — and a Next button is how a user reaches that card
+    /// without having typed a page number at all.
+    #[test]
+    fn a_page_past_the_end_does_not_claim_the_wallet_is_empty() {
+        let past_the_end = Paged::<TxSummary> {
+            items: vec![],
+            page: Page::new(99),
+            total: 25,
+        };
+        let card = history(Network::Regtest, &past_the_end);
+        assert!(card.contains("past the end"), "got: {card}");
+        assert!(
+            card.contains("3 pages"),
+            "it says how many there are: {card}"
+        );
+        assert!(
+            !card.contains("No transactions yet"),
+            "the wallet has 25 of them: {card}"
+        );
+
+        // A genuinely empty wallet still gets the invitation.
+        let empty = Paged::<TxSummary> {
+            items: vec![],
+            page: Page::new(0),
+            total: 0,
+        };
+        let card = history(Network::Regtest, &empty);
+        assert!(card.contains("No transactions yet"));
+        assert!(!card.contains("past the end"));
     }
 
     #[test]
@@ -2710,6 +2906,19 @@ mod html_tests {
                         items: vec![],
                         page: Page::new(0),
                         total: 0,
+                    },
+                ),
+            );
+            // The other empty: a page past the end, which a stale Next button
+            // can reach.
+            assert_sendable(
+                "history/past the end",
+                &history(
+                    network,
+                    &Paged {
+                        items: vec![],
+                        page: Page::new(99),
+                        total: 25,
                     },
                 ),
             );

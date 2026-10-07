@@ -140,7 +140,7 @@ file refuses to load under the wrong chain.
 | `/receive` | Next unused address, as a QR and a BIP21 URI |
 | `/addresses [page]` | Revealed addresses with used/unused and amounts received |
 | `/balance` | Confirmed, pending, incoming and immature, with a Refresh button |
-| `/history [page]` | Transactions, newest first, with fees and confirmations |
+| `/history [page]` | Transactions, newest first, with fees and confirmations, and Previous/Next buttons where there is more than one page |
 | `/tx <txid>` | One transaction in detail |
 | `/send <address\|bip21> [sats\|max]` | Fee choice → confirmation card → PIN → broadcast |
 | `/bumpfee <txid>` | Raise the fee on a stuck transaction — the same fee card as `/send` |
@@ -170,6 +170,10 @@ Six commands have no button, each for a reason:
 
 `/send` does have one: it shows the usage card, which is exactly what bare `/send`
 does, since a button cannot carry a destination.
+
+`/history` has its own two buttons as well. Previous and Next edit the card in
+place rather than posting another one, so paging through six screens leaves one
+message behind, and neither appears where there is no page to go to.
 
 ---
 

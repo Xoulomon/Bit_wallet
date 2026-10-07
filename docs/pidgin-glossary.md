@@ -41,7 +41,7 @@ would cost comprehension and buy nothing.
 - `comfy-table` headers — `#`, `Address`, `Used`, `Received`, `Amount`, `Fee`,
   `Status`;
 - network badges — `MAINNET`, `REGTEST`, `TESTNET`, `SIGNET`;
-- callback data and fee slugs — `send:fee:fast`, `bal:refresh`, …;
+- callback data and fee slugs — `send:fee:fast`, `bal:refresh`, `hist:page:2`, `cmd:balance:-`, …;
 - command names — `/send`, `/pj_receive`, …
 
 **Budgets.** Measured, not guessed:
@@ -195,6 +195,9 @@ chosen here becomes the assertion.
 | `ui::addresses#1` | No addresses yet. /receive makes one. | No address dey yet. /receive go make one. | `/receive` | OK | |
 | `ui::addresses#2` | yes | yes | | ?? | table cell — translate or keep? see Decisions |
 | `ui::history#1` | No transactions yet. /receive gives you an address to be paid at. | No transaction dey yet. /receive go give you address wey person go pay you for. | `/receive` | OK | |
+| `ui::history#2` | That page is past the end — your history has {n} pages. /history goes back to the first. | Dat page don pass di end — your history get {n} pages. /history go carry you back to di first one. | `{n}`, `/history` | ?? | only reachable from a stale Next button |
+| `btn::history_prev` | ◀ Previous | ◀ Before | ◀ | ?? | button; `/history` paging, ~10 chars |
+| `btn::history_next` | Next ▶ | Next ▶ | ▶ | ?? | button; `/history` paging, ~10 chars |
 | `ui::tx_detail#1` | Received | Dem send you | | ?? | heading beside the amount |
 | `ui::tx_detail#2` | Sent | You send | | ?? | |
 | `ui::tx_detail#3` | Moved | You move am | | ?? | internal transfer |

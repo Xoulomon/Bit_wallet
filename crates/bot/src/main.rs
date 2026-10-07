@@ -162,6 +162,13 @@ fn schema() -> teloxide::dispatching::UpdateHandler<anyhow::Error> {
             dptree::filter(|q: CallbackQuery| q.data.as_deref() == Some("bal:refresh"))
                 .endpoint(handlers::onchain::refresh_balance),
         )
+        // Paging /history. Outside the dialogue, like Refresh: turning a page
+        // reads, so it has nothing to say to a flow the user is in the middle
+        // of and must not be blocked by one either.
+        .branch(
+            dptree::filter(starts_with(ui::HISTORY_PAGE_PREFIX))
+                .endpoint(handlers::onchain::turn_history_page),
+        )
         .enter_dialogue::<CallbackQuery, SqliteDialogueStore, State>()
         // The inline menu (§8.2): every button here runs the same function the
         // typed command runs. It is inside the dialogue so /create and /unlock
