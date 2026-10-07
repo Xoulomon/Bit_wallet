@@ -4,6 +4,11 @@
 //! hand the result to `ui`. None of these needs a PIN, because the persisted
 //! descriptors are public (§5) — that is the property that makes a wallet
 //! usable as a chat without unlocking it every few minutes.
+//!
+//! Each command is a thin entry point over a `show_*` taking a `ChatId`, so the
+//! inline menu (§8.5) runs the command itself rather than a copy of it. The
+//! page argument becomes a `Page` at the boundary, which is what lets a button
+//! ask for the first page without parsing a string it never had.
 
 use crate::{Ctx, ui};
 use anyhow::Result;
@@ -55,9 +60,13 @@ fn page_arg(raw: &str) -> Page {
 
 pub async fn receive(bot: Bot, msg: Message, ctx: Ctx) -> Result<()> {
     let user = user_of(&msg, &ctx)?;
+    show_receive(&bot, msg.chat.id, &ctx, user).await
+}
+
+pub async fn show_receive(bot: &Bot, chat: ChatId, ctx: &Ctx, user: UserId) -> Result<()> {
     let info = match ctx.core.next_address(user).await {
         Ok(info) => info,
-        Err(e) => return crate::handlers::reply_error(&bot, &msg, &e).await,
+        Err(e) => return crate::handlers::reply_error_at(bot, chat, "/receive", &e).await,
     };
 
     let caption = ui::receive(ctx.core.network(), &info, ctx.core.capabilities().mempool);
@@ -66,14 +75,14 @@ pub async fn receive(bot: Bot, msg: Message, ctx: Ctx) -> Result<()> {
     // fails, the address still has to arrive — as text rather than not at all.
     match qr_png(&info) {
         Ok(png) => {
-            bot.send_photo(msg.chat.id, InputFile::memory(png))
+            bot.send_photo(chat, InputFile::memory(png))
                 .caption(caption)
                 .parse_mode(ParseMode::Html)
                 .await?;
         }
         Err(e) => {
             tracing::warn!(error = %e, "QR rendering failed; sending the address as text");
-            bot.send_message(msg.chat.id, caption)
+            bot.send_message(chat, caption)
                 .parse_mode(ParseMode::Html)
                 .await?;
         }
@@ -97,22 +106,27 @@ fn qr_png(info: &AddressInfo) -> Result<Vec<u8>> {
 
 pub async fn balance(bot: Bot, msg: Message, ctx: Ctx) -> Result<()> {
     let user = user_of(&msg, &ctx)?;
+    show_balance(&bot, msg.chat.id, &ctx, user).await
+}
+
+pub async fn show_balance(bot: &Bot, chat: ChatId, ctx: &Ctx, user: UserId) -> Result<()> {
     let price = ctx.core.price().await;
     match ctx.core.balance(user).await {
         Ok(b) => {
-            bot.send_message(
-                msg.chat.id,
-                ui::balance(ctx.core.network(), &b, price.as_ref()),
-            )
-            .parse_mode(ParseMode::Html)
-            .reply_markup(InlineKeyboardMarkup::new([[
-                InlineKeyboardButton::callback("🔄 Refresh", "bal:refresh"),
-            ]]))
-            .await?;
+            bot.send_message(chat, ui::balance(ctx.core.network(), &b, price.as_ref()))
+                .parse_mode(ParseMode::Html)
+                .reply_markup(refresh_keyboard())
+                .await?;
         }
-        Err(e) => return crate::handlers::reply_error(&bot, &msg, &e).await,
+        Err(e) => return crate::handlers::reply_error_at(bot, chat, "/balance", &e).await,
     }
     Ok(())
+}
+
+/// The one button on a balance card. Written once, because the refresh handler
+/// has to redraw the identical keyboard or the card loses it on the first tap.
+fn refresh_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new([[InlineKeyboardButton::callback("🔄 Refresh", "bal:refresh")]])
 }
 
 /// The Refresh button of §8.2. Syncs first, then edits the card in place
@@ -141,9 +155,7 @@ pub async fn refresh_balance(bot: Bot, query: CallbackQuery, ctx: Ctx) -> Result
                     ui::balance(ctx.core.network(), &b, price.as_ref()),
                 )
                 .parse_mode(ParseMode::Html)
-                .reply_markup(InlineKeyboardMarkup::new([[
-                    InlineKeyboardButton::callback("🔄 Refresh", "bal:refresh"),
-                ]]))
+                .reply_markup(refresh_keyboard())
                 .await;
 
             // A refresh that changes nothing produces a byte-identical card,
@@ -166,27 +178,101 @@ pub async fn refresh_balance(bot: Bot, query: CallbackQuery, ctx: Ctx) -> Result
 
 pub async fn addresses(bot: Bot, msg: Message, ctx: Ctx, page: String) -> Result<()> {
     let user = user_of(&msg, &ctx)?;
-    match ctx.core.addresses(user, page_arg(&page)).await {
+    show_addresses(&bot, msg.chat.id, &ctx, user, page_arg(&page)).await
+}
+
+pub async fn show_addresses(
+    bot: &Bot,
+    chat: ChatId,
+    ctx: &Ctx,
+    user: UserId,
+    page: Page,
+) -> Result<()> {
+    match ctx.core.addresses(user, page).await {
         Ok(listing) => {
-            bot.send_message(msg.chat.id, ui::addresses(ctx.core.network(), &listing))
+            bot.send_message(chat, ui::addresses(ctx.core.network(), &listing))
                 .parse_mode(ParseMode::Html)
                 .await?;
         }
-        Err(e) => return crate::handlers::reply_error(&bot, &msg, &e).await,
+        Err(e) => return crate::handlers::reply_error_at(bot, chat, "/addresses", &e).await,
     }
     Ok(())
 }
 
 pub async fn history(bot: Bot, msg: Message, ctx: Ctx, page: String) -> Result<()> {
     let user = user_of(&msg, &ctx)?;
-    match ctx.core.history(user, page_arg(&page)).await {
+    show_history(&bot, msg.chat.id, &ctx, user, page_arg(&page)).await
+}
+
+pub async fn show_history(
+    bot: &Bot,
+    chat: ChatId,
+    ctx: &Ctx,
+    user: UserId,
+    page: Page,
+) -> Result<()> {
+    match ctx.core.history(user, page).await {
         Ok(listing) => {
-            bot.send_message(msg.chat.id, ui::history(ctx.core.network(), &listing))
+            let mut card = bot
+                .send_message(chat, ui::history(ctx.core.network(), &listing))
                 .parse_mode(ParseMode::Html)
-                .link_preview_options(no_preview())
-                .await?;
+                .link_preview_options(no_preview());
+
+            // Only where there is somewhere to go. A single page gets no row.
+            if let Some(keyboard) = ui::history_keyboard(&listing) {
+                card = card.reply_markup(keyboard);
+            }
+            card.await?;
         }
-        Err(e) => return crate::handlers::reply_error(&bot, &msg, &e).await,
+        Err(e) => return crate::handlers::reply_error_at(bot, chat, "/history", &e).await,
+    }
+    Ok(())
+}
+
+/// The Previous and Next buttons of `/history` (§8.2).
+///
+/// Edits the card in place rather than posting another one (§8.1): paging
+/// through six screens of history should leave one message behind, not six.
+pub async fn turn_history_page(bot: Bot, query: CallbackQuery, ctx: Ctx) -> Result<()> {
+    bot.answer_callback_query(query.id.clone()).await?;
+
+    let Some(message) = query.message.as_ref() else {
+        return Ok(());
+    };
+    let Some(index) = query.data.as_deref().and_then(ui::history_page_from_data) else {
+        tracing::warn!(data = ?query.data, "a history button carried no page number");
+        return Ok(());
+    };
+
+    #[allow(clippy::cast_possible_wrap)]
+    let user = ctx.users.resolve(query.from.id.0 as i64)?;
+    let chat = message.chat().id;
+
+    let listing = match ctx.core.history(user, Page::new(index)).await {
+        Ok(listing) => listing,
+        Err(e) => return crate::handlers::reply_error_at(&bot, chat, "/history", &e).await,
+    };
+
+    let edit = bot
+        .edit_message_text(
+            chat,
+            message.id(),
+            ui::history(ctx.core.network(), &listing),
+        )
+        .parse_mode(ParseMode::Html)
+        .link_preview_options(no_preview())
+        // Always, even when it is empty. An edit that omits the markup leaves
+        // the old one in place, so the last page would keep a Next button
+        // pointing past the end of the history.
+        .reply_markup(ui::history_keyboard(&listing).unwrap_or_default())
+        .await;
+
+    // The same card again — a tap on a page the screen is already showing.
+    // Nothing is wrong, so nothing is reported.
+    if let Err(e) = edit
+        && !is_unmodified(&e)
+    {
+        return Err(e.into());
     }
     Ok(())
 }

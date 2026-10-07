@@ -49,15 +49,18 @@ async fn scrub(bot: &Bot, msg: &Message) {
 
 pub async fn create(bot: Bot, msg: Message, dialogue: WalletDialogue, ctx: Ctx) -> Result<()> {
     let user = user_of(&msg, &ctx)?;
+    begin_create(&bot, msg.chat.id, &dialogue, &ctx, user).await
+}
 
+pub async fn begin_create(
+    bot: &Bot,
+    chat: ChatId,
+    dialogue: &WalletDialogue,
+    ctx: &Ctx,
+    user: UserId,
+) -> Result<()> {
     if ctx.core.wallet_exists(user)? {
-        bot.send_message(
-            msg.chat.id,
-            ui::render_error(&wallet_core::CoreError::WalletExists),
-        )
-        .parse_mode(ParseMode::Html)
-        .await?;
-        return Ok(());
+        return already_has_one(bot, chat).await;
     }
 
     dialogue
@@ -66,7 +69,7 @@ pub async fn create(bot: Bot, msg: Message, dialogue: WalletDialogue, ctx: Ctx) 
         })
         .await?;
 
-    bot.send_message(msg.chat.id, ui::ask_pin_new())
+    bot.send_message(chat, ui::ask_pin_new())
         .parse_mode(ParseMode::Html)
         .await?;
     Ok(())
@@ -74,21 +77,36 @@ pub async fn create(bot: Bot, msg: Message, dialogue: WalletDialogue, ctx: Ctx) 
 
 pub async fn restore(bot: Bot, msg: Message, dialogue: WalletDialogue, ctx: Ctx) -> Result<()> {
     let user = user_of(&msg, &ctx)?;
+    begin_restore(&bot, msg.chat.id, &dialogue, &ctx, user).await
+}
 
+pub async fn begin_restore(
+    bot: &Bot,
+    chat: ChatId,
+    dialogue: &WalletDialogue,
+    ctx: &Ctx,
+    user: UserId,
+) -> Result<()> {
     if ctx.core.wallet_exists(user)? {
-        bot.send_message(
-            msg.chat.id,
-            ui::render_error(&wallet_core::CoreError::WalletExists),
-        )
-        .parse_mode(ParseMode::Html)
-        .await?;
-        return Ok(());
+        return already_has_one(bot, chat).await;
     }
 
     dialogue.update(State::RestoreMnemonic).await?;
-    bot.send_message(msg.chat.id, ui::ask_mnemonic())
+    bot.send_message(chat, ui::ask_mnemonic())
         .parse_mode(ParseMode::Html)
         .await?;
+    Ok(())
+}
+
+/// The refusal both /create and /restore give, since both mean "make a wallet"
+/// and core rejects either one the same way.
+async fn already_has_one(bot: &Bot, chat: ChatId) -> Result<()> {
+    bot.send_message(
+        chat,
+        ui::render_error(&wallet_core::CoreError::WalletExists),
+    )
+    .parse_mode(ParseMode::Html)
+    .await?;
     Ok(())
 }
 
@@ -328,16 +346,30 @@ pub async fn receive_backup_word(
 
 pub async fn unlock(bot: Bot, msg: Message, dialogue: WalletDialogue, ctx: Ctx) -> Result<()> {
     let user = user_of(&msg, &ctx)?;
+    begin_unlock(&bot, msg.chat.id, &dialogue, &ctx, user).await
+}
+
+pub async fn begin_unlock(
+    bot: &Bot,
+    chat: ChatId,
+    dialogue: &WalletDialogue,
+    ctx: &Ctx,
+    user: UserId,
+) -> Result<()> {
     if !ctx.core.wallet_exists(user)? {
-        return reply_error(&bot, &msg, &wallet_core::CoreError::NoWallet).await;
+        return no_wallet(bot, chat, "/unlock").await;
     }
-    ask_pin_for(bot, msg, dialogue, PendingAction::Unlock).await
+    ask_pin_for(bot, chat, dialogue, PendingAction::Unlock).await
 }
 
 pub async fn lock(bot: Bot, msg: Message, ctx: Ctx) -> Result<()> {
     let user = user_of(&msg, &ctx)?;
+    do_lock(&bot, msg.chat.id, &ctx, user).await
+}
+
+pub async fn do_lock(bot: &Bot, chat: ChatId, ctx: &Ctx, user: UserId) -> Result<()> {
     ctx.core.lock(user);
-    bot.send_message(msg.chat.id, ui::locked()).await?;
+    bot.send_message(chat, ui::locked()).await?;
     Ok(())
 }
 
@@ -346,10 +378,14 @@ pub async fn export(bot: Bot, msg: Message, dialogue: WalletDialogue, ctx: Ctx) 
     if !ctx.core.wallet_exists(user)? {
         return reply_error(&bot, &msg, &wallet_core::CoreError::NoWallet).await;
     }
-    ask_pin_for(bot, msg, dialogue, PendingAction::Export).await
+    ask_pin_for(&bot, msg.chat.id, &dialogue, PendingAction::Export).await
 }
 
 /// §8.1: a destructive action needs a typed word, not just a button.
+///
+/// Which is also why neither this nor /export has an inline button: the rule is
+/// about making the user spell the intent out, and a tap that merely *opens*
+/// the flow still turns one stray thumb into the first half of a deletion.
 pub async fn delete(bot: Bot, msg: Message, dialogue: WalletDialogue, ctx: Ctx) -> Result<()> {
     let user = user_of(&msg, &ctx)?;
     if !ctx.core.wallet_exists(user)? {
@@ -369,20 +405,26 @@ pub async fn receive_delete_word(bot: Bot, msg: Message, dialogue: WalletDialogu
             .await?;
         return Ok(());
     }
-    ask_pin_for(bot, msg, dialogue, PendingAction::Delete).await
+    ask_pin_for(&bot, msg.chat.id, &dialogue, PendingAction::Delete).await
 }
 
 async fn ask_pin_for(
-    bot: Bot,
-    msg: Message,
-    dialogue: WalletDialogue,
+    bot: &Bot,
+    chat: ChatId,
+    dialogue: &WalletDialogue,
     pending: PendingAction,
 ) -> Result<()> {
     dialogue.update(State::AwaitPin { pending }).await?;
-    bot.send_message(msg.chat.id, ui::ask_pin())
+    bot.send_message(chat, ui::ask_pin())
         .parse_mode(ParseMode::Html)
         .await?;
     Ok(())
+}
+
+/// `NoWallet`, named by the command that hit it, for the handlers that can be
+/// reached without a `Message` to quote.
+async fn no_wallet(bot: &Bot, chat: ChatId, command: &str) -> Result<()> {
+    crate::handlers::reply_error_at(bot, chat, command, &wallet_core::CoreError::NoWallet).await
 }
 
 /// The single place a PIN is collected for an existing wallet (§8.4).

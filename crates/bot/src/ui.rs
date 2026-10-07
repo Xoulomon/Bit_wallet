@@ -154,6 +154,164 @@ pub fn welcome(network: Network, has_wallet: bool) -> String {
     }
 }
 
+/// A command a button can stand in for (§8.2, §8.5).
+///
+/// Every variant is a command that takes no argument, which is the whole
+/// entry rule: a tap carries intent and nothing else, so `cmd:<slug>:-` is
+/// the complete instruction and the handler needs nothing from the card the
+/// button was drawn on. That is what lets a button and the typed command run
+/// the *same* function rather than two that look alike.
+///
+/// Absent, deliberately:
+/// * `/tx`, `/bumpfee`, `/pj_receive`, `/mine` — each needs an argument a
+///   button cannot supply, and a button that opens a prompt for one is a
+///   different flow from the command, not the same one.
+/// * `/export` and `/delete` — §8.1 already rules that a destructive action
+///   takes a typed word rather than a button press. The command that *starts*
+///   one is the same question, so both stay typed-only.
+///
+/// `Send` is here because bare `/send` has its own well-defined behaviour —
+/// it prints the usage card — and that is exactly what the button does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuCommand {
+    Create,
+    Restore,
+    Unlock,
+    Lock,
+    Balance,
+    Receive,
+    Send,
+    History,
+    Addresses,
+    PjSessions,
+    Faucet,
+    Status,
+    Network,
+    Help,
+}
+
+/// Every variant, so the round-trip test and the keyboard cannot disagree
+/// about what exists.
+const MENU_COMMANDS: [MenuCommand; 14] = [
+    MenuCommand::Create,
+    MenuCommand::Restore,
+    MenuCommand::Unlock,
+    MenuCommand::Lock,
+    MenuCommand::Balance,
+    MenuCommand::Receive,
+    MenuCommand::Send,
+    MenuCommand::History,
+    MenuCommand::Addresses,
+    MenuCommand::PjSessions,
+    MenuCommand::Faucet,
+    MenuCommand::Status,
+    MenuCommand::Network,
+    MenuCommand::Help,
+];
+
+impl MenuCommand {
+    /// The slug carried in the callback data.
+    ///
+    /// It is the command's own name, so a log line, a callback payload and the
+    /// thing a user could have typed instead all read the same.
+    pub fn slug(self) -> &'static str {
+        match self {
+            MenuCommand::Create => "create",
+            MenuCommand::Restore => "restore",
+            MenuCommand::Unlock => "unlock",
+            MenuCommand::Lock => "lock",
+            MenuCommand::Balance => "balance",
+            MenuCommand::Receive => "receive",
+            MenuCommand::Send => "send",
+            MenuCommand::History => "history",
+            MenuCommand::Addresses => "addresses",
+            MenuCommand::PjSessions => "pj_sessions",
+            MenuCommand::Faucet => "faucet",
+            MenuCommand::Status => "status",
+            MenuCommand::Network => "network",
+            MenuCommand::Help => "help",
+        }
+    }
+
+    /// `None` for anything this build does not recognise — an older card in an
+    /// older chat can outlive the button it carries.
+    pub fn from_slug(slug: &str) -> Option<MenuCommand> {
+        MENU_COMMANDS.into_iter().find(|c| c.slug() == slug)
+    }
+
+    /// What the button says. The cards keep listing the commands in text, so
+    /// the menu is a shortcut for someone who knows them and a hint for
+    /// someone who does not — it never has to be the only way in.
+    fn label(self) -> &'static str {
+        match self {
+            MenuCommand::Create => "🆕 Create wallet",
+            MenuCommand::Restore => "♻️ Restore wallet",
+            MenuCommand::Unlock => "🔓 Unlock",
+            MenuCommand::Lock => "🔒 Lock",
+            MenuCommand::Balance => "💰 Balance",
+            MenuCommand::Receive => "📥 Receive",
+            MenuCommand::Send => "📤 Send",
+            MenuCommand::History => "📜 History",
+            MenuCommand::Addresses => "🏷 Addresses",
+            MenuCommand::PjSessions => "🤝 Payjoin",
+            MenuCommand::Faucet => "🚰 Faucet",
+            MenuCommand::Status => "📡 Status",
+            MenuCommand::Network => "🌐 Network",
+            MenuCommand::Help => "❓ Help",
+        }
+    }
+
+    /// §8.5: `action:subject:arg`. The arg is always `-`, because a command
+    /// that needed one could not be on this menu in the first place.
+    pub fn callback_data(self) -> String {
+        format!("{}{}:-", MENU_PREFIX, self.slug())
+    }
+}
+
+/// The routing prefix of §8.5, in one place so the dispatcher and the buttons
+/// cannot disagree about it.
+pub const MENU_PREFIX: &str = "cmd:";
+
+/// The menu that goes under the `/start` and `/help` cards.
+///
+/// What it offers depends on the wallet and the chain, for the same reason
+/// [`network_card`] is exhaustive: a button core will refuse is worse than no
+/// button, because the user has no way to tell which it was.
+pub fn menu_keyboard(network: Network, has_wallet: bool) -> InlineKeyboardMarkup {
+    let rows: Vec<Vec<MenuCommand>> = if has_wallet {
+        let mut rows = vec![
+            vec![MenuCommand::Balance, MenuCommand::Receive],
+            vec![MenuCommand::Send, MenuCommand::History],
+            vec![MenuCommand::Addresses, MenuCommand::PjSessions],
+            // Both, always. Which one applies depends on a session that can
+            // expire while the card sits in the chat, and a keyboard drawn
+            // from state goes stale silently — one of the two buttons simply
+            // stops being there when it is the one you want.
+            vec![MenuCommand::Unlock, MenuCommand::Lock],
+        ];
+        if network == Network::Regtest {
+            rows.push(vec![MenuCommand::Faucet]);
+        }
+        rows.push(vec![MenuCommand::Status, MenuCommand::Network]);
+        rows.push(vec![MenuCommand::Help]);
+        rows
+    } else {
+        // No /balance, no /receive: there is nothing to show yet, and core
+        // would answer every one of them with NoWallet.
+        vec![
+            vec![MenuCommand::Create, MenuCommand::Restore],
+            vec![MenuCommand::Status, MenuCommand::Network],
+            vec![MenuCommand::Help],
+        ]
+    };
+
+    InlineKeyboardMarkup::new(rows.into_iter().map(|row| {
+        row.into_iter()
+            .map(|c| InlineKeyboardButton::callback(c.label(), c.callback_data()))
+            .collect::<Vec<_>>()
+    }))
+}
+
 /// `/status` (§8.2). The call budget appears only where there is one to spend.
 ///
 /// The price row is always drawn, including when there is no price. A missing
@@ -540,6 +698,114 @@ mod tests {
         let rendered = render_error(&CoreError::Locked);
         assert!(rendered.contains("/unlock"));
     }
+
+    /// Every slug the keyboard can draw is one `from_slug` reads back.
+    ///
+    /// This is the join between the two halves of the feature: the button is
+    /// rendered here and routed in `handlers::menu`, and a slug that only one
+    /// side knows is a button that does nothing when it is tapped.
+    #[test]
+    fn menu_slugs_round_trip() {
+        for command in MENU_COMMANDS {
+            assert_eq!(
+                MenuCommand::from_slug(command.slug()),
+                Some(command),
+                "`{}` is drawn on a button but routes to nothing",
+                command.slug()
+            );
+        }
+        assert_eq!(MenuCommand::from_slug("nonsense"), None);
+    }
+
+    /// The slugs are the command names, which is the property that lets a
+    /// reader of `cmd:balance:-` know what was tapped without a lookup table.
+    #[test]
+    fn a_menu_slug_is_the_command_it_runs() {
+        assert_eq!(MenuCommand::Balance.slug(), "balance");
+        // The underscored one specifically: a rename rule mangling it is
+        // exactly how /pj_receive once became an update nothing handled.
+        assert_eq!(MenuCommand::PjSessions.slug(), "pj_sessions");
+    }
+
+    /// §8.5 again, for the menu: the data is a command name and nothing else,
+    /// so a replayed tap can only re-run something the user could type.
+    #[test]
+    fn menu_callback_data_is_a_command_and_an_empty_argument() {
+        for command in MENU_COMMANDS {
+            let data = command.callback_data();
+            assert!(data.starts_with(MENU_PREFIX));
+            assert!(data.ends_with(":-"), "{data} should carry no argument");
+            assert!(
+                data.len() <= 64,
+                "Telegram's callback data limit is 64 bytes"
+            );
+        }
+    }
+
+    /// A button core would refuse is worse than no button: the user cannot
+    /// tell a chain that has no faucet from a bot that is broken.
+    #[test]
+    fn the_faucet_button_appears_only_where_there_is_a_faucet() {
+        assert!(menu_has(Network::Regtest, true, MenuCommand::Faucet));
+        for chain in [
+            Network::Bitcoin,
+            Network::Testnet,
+            Network::Testnet4,
+            Network::Signet,
+        ] {
+            assert!(
+                !menu_has(chain, true, MenuCommand::Faucet),
+                "{chain} has no /faucet, so it must not be offered one"
+            );
+        }
+    }
+
+    /// Before a wallet exists the only useful commands are the two that make
+    /// one; /balance would answer NoWallet and teach the user nothing.
+    #[test]
+    fn the_menu_before_a_wallet_offers_only_what_works_without_one() {
+        assert!(menu_has(Network::Regtest, false, MenuCommand::Create));
+        assert!(menu_has(Network::Regtest, false, MenuCommand::Restore));
+        assert!(!menu_has(Network::Regtest, false, MenuCommand::Balance));
+        assert!(!menu_has(Network::Regtest, false, MenuCommand::Send));
+
+        // And once there is one, /create is not on offer — core refuses it.
+        assert!(!menu_has(Network::Regtest, true, MenuCommand::Create));
+        assert!(menu_has(Network::Regtest, true, MenuCommand::Balance));
+    }
+
+    /// §8.1: a destructive action takes a typed word. Neither of the two
+    /// commands that start one may be reachable by a tap.
+    #[test]
+    fn nothing_destructive_is_one_tap_away() {
+        for has_wallet in [true, false] {
+            for chain in [Network::Bitcoin, Network::Regtest] {
+                let data = menu_data(chain, has_wallet);
+                for forbidden in ["export", "delete", "mine"] {
+                    assert!(
+                        !data.iter().any(|d| d.contains(forbidden)),
+                        "/{forbidden} must stay a typed command"
+                    );
+                }
+            }
+        }
+    }
+
+    fn menu_data(network: Network, has_wallet: bool) -> Vec<String> {
+        menu_keyboard(network, has_wallet)
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .filter_map(|b| match &b.kind {
+                teloxide::types::InlineKeyboardButtonKind::CallbackData(d) => Some(d.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn menu_has(network: Network, has_wallet: bool, command: MenuCommand) -> bool {
+        menu_data(network, has_wallet).contains(&command.callback_data())
+    }
 }
 
 #[cfg(test)]
@@ -753,10 +1019,7 @@ pub fn addresses(network: Network, page: &Paged<AddressInfo>) -> String {
 
 pub fn history(network: Network, page: &Paged<TxSummary>) -> String {
     if page.items.is_empty() {
-        return format!(
-            "{}\n\nNo transactions yet. /receive gives you an address to be paid at.",
-            badge(network)
-        );
+        return empty_history(network, page);
     }
 
     let mut table = Table::new();
@@ -798,6 +1061,74 @@ pub fn history(network: Network, page: &Paged<TxSummary>) -> String {
 }
 
 /// §8.2: one transaction in detail.
+/// Two different nothings.
+///
+/// A wallet with no transactions at all, and a page past the end of one that
+/// has them. `/history 99` has always answered both with "No transactions yet",
+/// which is a lie in the second case — and the Next button is what turns that
+/// from a typo nobody makes into a thumb away.
+fn empty_history(network: Network, page: &Paged<TxSummary>) -> String {
+    if page.total == 0 {
+        return format!(
+            "{}\n\nNo transactions yet. /receive gives you an address to be paid at.",
+            badge(network)
+        );
+    }
+
+    let pages = match page.total_pages() {
+        1 => "one page".to_string(),
+        n => format!("{n} pages"),
+    };
+    format!(
+        "{}\n\nThat page is past the end — your history has {pages}. \
+         /history goes back to the first.",
+        badge(network)
+    )
+}
+
+/// Previous and Next for `/history` (§8.2).
+///
+/// `None` where there is nothing to navigate: one page needs no buttons, and a
+/// keyboard whose every button is absent is worse than no keyboard, because the
+/// card grows a row that does nothing.
+///
+/// The data carries a page index, which is not an id core minted — the one
+/// exception §8.5 allows itself, for the same reason `send:fee:` carries a
+/// label. An index is a read offset. It names no amount and no address, core
+/// re-reads the page under it, and replaying one can only show the user their
+/// own history again.
+pub fn history_keyboard(page: &Paged<TxSummary>) -> Option<InlineKeyboardMarkup> {
+    let mut row: Vec<InlineKeyboardButton> = Vec::with_capacity(2);
+
+    if page.has_prev() {
+        row.push(InlineKeyboardButton::callback(
+            "◀ Previous",
+            history_page_data(page.page.index - 1),
+        ));
+    }
+    if page.has_next() {
+        row.push(InlineKeyboardButton::callback(
+            "Next ▶",
+            history_page_data(page.page.index + 1),
+        ));
+    }
+
+    (!row.is_empty()).then(|| InlineKeyboardMarkup::new([row]))
+}
+
+/// The routing prefix of §8.5 for a page turn, in one place so the buttons and
+/// the dispatcher cannot disagree about it.
+pub const HISTORY_PAGE_PREFIX: &str = "hist:page:";
+
+fn history_page_data(index: u32) -> String {
+    format!("{HISTORY_PAGE_PREFIX}{index}")
+}
+
+/// The index a `hist:page:` tap asks for, or `None` for anything else.
+pub fn history_page_from_data(data: &str) -> Option<u32> {
+    data.strip_prefix(HISTORY_PAGE_PREFIX)?.parse().ok()
+}
+
 pub fn tx_detail(network: Network, d: &TxDetail, price: Option<&FiatPrice>) -> String {
     let s = &d.summary;
     let mut out = format!(
@@ -888,6 +1219,19 @@ pub fn incoming(amount: Amount, status: TxStatus, price: Option<&FiatPrice>) -> 
     if let Some(price) = price {
         out.push_str(&format!("\n{}", usd(amount, price)));
     }
+    out
+}
+
+/// A whole wallet's history arriving at once, collapsed. The first sync of a
+/// restored wallet — or of a regtest chain `/mine 101` just filled — finds
+/// every payment it ever received in a single pass, and announcing them one by
+/// one buries the only two numbers anyone wants: how many, and how much.
+pub fn incoming_many(count: usize, total: Amount, price: Option<&FiatPrice>) -> String {
+    let mut out = format!("📥 Received {count} payments — {}", sats(total));
+    if let Some(price) = price {
+        out.push_str(&format!("\n{}", usd(total, price)));
+    }
+    out.push_str("\n\n/history lists them; /balance has the total.");
     out
 }
 
@@ -1131,6 +1475,137 @@ mod onchain_tests {
         assert_eq!(pager(many.page, many.total_pages()), "Page 2 of 3");
     }
 
+    /// One row of history on each page, so a fixture can be any shape of
+    /// listing without carrying ten transactions around.
+    fn listing(index: u32, total: usize) -> Paged<TxSummary> {
+        Paged {
+            items: vec![TxSummary {
+                txid: txid(1),
+                direction: TxDirection::Incoming,
+                amount: Amount::from_sat(25_000),
+                fee: None,
+                status: TxStatus::Unconfirmed,
+                timestamp: None,
+            }],
+            page: Page::new(index),
+            total,
+        }
+    }
+
+    fn buttons(keyboard: &InlineKeyboardMarkup) -> Vec<(String, String)> {
+        keyboard
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .filter_map(|b| match &b.kind {
+                teloxide::types::InlineKeyboardButtonKind::CallbackData(d) => {
+                    Some((b.text.clone(), d.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The first page can only go forward, the last only back, and a middle
+    /// page both ways. Getting this wrong is a button that pages off the end.
+    #[test]
+    fn history_offers_only_the_pages_that_exist() {
+        // 25 transactions at ten a page is three pages: 0, 1, 2.
+        let first = history_keyboard(&listing(0, 25)).expect("more than one page");
+        assert_eq!(
+            buttons(&first),
+            vec![("Next ▶".to_string(), "hist:page:1".to_string())],
+            "the first page has nothing behind it"
+        );
+
+        let middle = history_keyboard(&listing(1, 25)).expect("more than one page");
+        assert_eq!(
+            buttons(&middle),
+            vec![
+                ("◀ Previous".to_string(), "hist:page:0".to_string()),
+                ("Next ▶".to_string(), "hist:page:2".to_string()),
+            ]
+        );
+
+        let last = history_keyboard(&listing(2, 25)).expect("more than one page");
+        assert_eq!(
+            buttons(&last),
+            vec![("◀ Previous".to_string(), "hist:page:1".to_string())],
+            "the last page must not offer a Next that pages off the end"
+        );
+    }
+
+    /// A row of no buttons is worse than no row: the card grows something that
+    /// does nothing.
+    #[test]
+    fn a_single_page_of_history_gets_no_buttons() {
+        assert!(history_keyboard(&listing(0, 1)).is_none());
+        assert!(history_keyboard(&listing(0, 10)).is_none());
+        // Eleven is two pages, and then there is somewhere to go.
+        assert!(history_keyboard(&listing(0, 11)).is_some());
+    }
+
+    /// The round trip the dispatcher depends on: what the button carries is
+    /// what the handler reads back out of it.
+    #[test]
+    fn a_page_button_round_trips_through_its_callback_data() {
+        for (_, data) in buttons(&history_keyboard(&listing(1, 25)).expect("two buttons")) {
+            assert!(history_page_from_data(&data).is_some(), "{data} parses");
+            assert!(
+                data.len() <= 64,
+                "Telegram's callback data limit is 64 bytes"
+            );
+        }
+        assert_eq!(history_page_from_data("hist:page:7"), Some(7));
+
+        // Nothing else is claimed, so this endpoint cannot swallow a tap that
+        // belongs to the send flow, to Refresh or to the menu.
+        for other in [
+            "hist:page:",
+            "hist:page:x",
+            "hist:page:-1",
+            "bal:refresh",
+            "cmd:history:-",
+            "send:confirm:01HXYZ",
+        ] {
+            assert_eq!(history_page_from_data(other), None, "{other}");
+        }
+    }
+
+    /// Two different nothings, and they used to read the same.
+    ///
+    /// `/history 99` on a wallet with transactions said "No transactions yet",
+    /// which is a lie — and a Next button is how a user reaches that card
+    /// without having typed a page number at all.
+    #[test]
+    fn a_page_past_the_end_does_not_claim_the_wallet_is_empty() {
+        let past_the_end = Paged::<TxSummary> {
+            items: vec![],
+            page: Page::new(99),
+            total: 25,
+        };
+        let card = history(Network::Regtest, &past_the_end);
+        assert!(card.contains("past the end"), "got: {card}");
+        assert!(
+            card.contains("3 pages"),
+            "it says how many there are: {card}"
+        );
+        assert!(
+            !card.contains("No transactions yet"),
+            "the wallet has 25 of them: {card}"
+        );
+
+        // A genuinely empty wallet still gets the invitation.
+        let empty = Paged::<TxSummary> {
+            items: vec![],
+            page: Page::new(0),
+            total: 0,
+        };
+        let card = history(Network::Regtest, &empty);
+        assert!(card.contains("No transactions yet"));
+        assert!(!card.contains("past the end"));
+    }
+
     #[test]
     fn six_confirmations_reads_as_settled() {
         assert!(
@@ -1187,6 +1662,18 @@ mod onchain_tests {
             .contains("Received")
         );
         assert!(confirmed(&txid(3).to_string(), 6).contains("6 confs"));
+    }
+
+    /// The whole point of the grouped line: a sync that finds a hundred
+    /// payments says how many and how much, and nothing per transaction.
+    #[test]
+    fn a_burst_of_arrivals_collapses_to_a_count_and_a_total() {
+        let text = incoming_many(101, Amount::from_sat(246_582_006), None);
+        assert!(text.contains("101 payments"));
+        assert!(text.contains("246,582,006 sats"));
+        assert!(text.contains("/history"));
+        // One line of numbers, then the pointer — not a line per payment.
+        assert!(text.lines().filter(|l| l.contains("sats")).count() == 1);
     }
 }
 
@@ -2422,6 +2909,19 @@ mod html_tests {
                     },
                 ),
             );
+            // The other empty: a page past the end, which a stale Next button
+            // can reach.
+            assert_sendable(
+                "history/past the end",
+                &history(
+                    network,
+                    &Paged {
+                        items: vec![],
+                        page: Page::new(99),
+                        total: 25,
+                    },
+                ),
+            );
             assert_sendable(
                 "tx_detail",
                 &tx_detail(
@@ -2543,6 +3043,10 @@ mod html_tests {
         assert_sendable(
             "incoming",
             &incoming(Amount::from_sat(1), TxStatus::Unconfirmed, None),
+        );
+        assert_sendable(
+            "incoming_many",
+            &incoming_many(101, Amount::from_sat(246_582_006), None),
         );
         assert_sendable("session_expired", &session_expired());
         assert_sendable("backend_degraded", &backend_degraded());

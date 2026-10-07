@@ -41,7 +41,7 @@ would cost comprehension and buy nothing.
 - `comfy-table` headers — `#`, `Address`, `Used`, `Received`, `Amount`, `Fee`,
   `Status`;
 - network badges — `MAINNET`, `REGTEST`, `TESTNET`, `SIGNET`;
-- callback data and fee slugs — `send:fee:fast`, `bal:refresh`, …;
+- callback data and fee slugs — `send:fee:fast`, `bal:refresh`, `hist:page:2`, `cmd:balance:-`, …;
 - command names — `/send`, `/pj_receive`, …
 
 **Budgets.** Measured, not guessed:
@@ -81,6 +81,34 @@ would cost comprehension and buy nothing.
 | `ui::network_card#5` | A private test chain. These coins are worth nothing — which is exactly what makes it the right place to learn the flows. | Na private test chain. Dis coin no get any value — na exactly why e good for learning how everything dey work. | | OK | |
 | `ui::network_card#6` | `/mine 101` mints blocks (admins only). | `/mine 101` dey make block (na admin only). | `/mine 101`, `<code>` | OK | |
 | `ui::network_card#7` | State for each network is stored separately; the two can never mix. | Each network get im own separate state; di two no fit mix at all. | | OK | |
+
+### The inline menu — `ui::menu_keyboard`
+
+The buttons under the `/start` and `/help` cards. Each one runs the command of the
+same name, so the label is a **name for the command**, not a sentence: `💰 Balance`
+is the button for `/balance`. Translating a label changes nothing the bot parses —
+the callback data carries the English slug (`cmd:balance:-`) and never the label —
+so these are free to read naturally in Pidgin.
+
+**Budget: ~14 characters.** They render two-across on a phone, so a label much
+longer than `♻️ Restore wallet` wraps or truncates.
+
+| ID | English | Pidgin | Must keep | Conf | Notes / your corrections |
+|---|---|---|---|---|---|
+| `btn::menu_create` | 🆕 Create wallet | 🆕 New wallet | 🆕 | ?? | runs `/create` |
+| `btn::menu_restore` | ♻️ Restore wallet | ♻️ Bring wallet back | ♻️ | XX | runs `/restore`; "Bring wallet back" may be too long — alternative: `♻️ Restore` |
+| `btn::menu_unlock` | 🔓 Unlock | 🔓 Open am | 🔓 | ?? | runs `/unlock` |
+| `btn::menu_lock` | 🔒 Lock | 🔒 Lock am | 🔒 | ?? | runs `/lock` |
+| `btn::menu_balance` | 💰 Balance | 💰 Balance | 💰 | OK | runs `/balance`; technical noun stays English |
+| `btn::menu_receive` | 📥 Receive | 📥 Collect | 📥 | ?? | runs `/receive` |
+| `btn::menu_send` | 📤 Send | 📤 Send | 📤 | OK | runs `/send` — shows the usage card, since a button carries no address |
+| `btn::menu_history` | 📜 History | 📜 History | 📜 | ?? | runs `/history` |
+| `btn::menu_addresses` | 🏷 Addresses | 🏷 Addresses | 🏷 | OK | runs `/addresses`; technical noun stays English |
+| `btn::menu_payjoin` | 🤝 Payjoin | 🤝 Payjoin | 🤝 | OK | runs `/pj_sessions`; technical noun stays English |
+| `btn::menu_faucet` | 🚰 Faucet | 🚰 Faucet | 🚰 | ?? | runs `/faucet`; regtest only |
+| `btn::menu_status` | 📡 Status | 📡 Status | 📡 | OK | runs `/status`; technical noun stays English |
+| `btn::menu_network` | 🌐 Network | 🌐 Network | 🌐 | OK | runs `/network`; technical noun stays English |
+| `btn::menu_help` | ❓ Help | ❓ Help | ❓ | OK | runs `/help` |
 
 ## 2. Errors — `ui::render_error`
 
@@ -167,6 +195,9 @@ chosen here becomes the assertion.
 | `ui::addresses#1` | No addresses yet. /receive makes one. | No address dey yet. /receive go make one. | `/receive` | OK | |
 | `ui::addresses#2` | yes | yes | | ?? | table cell — translate or keep? see Decisions |
 | `ui::history#1` | No transactions yet. /receive gives you an address to be paid at. | No transaction dey yet. /receive go give you address wey person go pay you for. | `/receive` | OK | |
+| `ui::history#2` | That page is past the end — your history has {n} pages. /history goes back to the first. | Dat page don pass di end — your history get {n} pages. /history go carry you back to di first one. | `{n}`, `/history` | ?? | only reachable from a stale Next button |
+| `btn::history_prev` | ◀ Previous | ◀ Before | ◀ | ?? | button; `/history` paging, ~10 chars |
+| `btn::history_next` | Next ▶ | Next ▶ | ▶ | ?? | button; `/history` paging, ~10 chars |
 | `ui::tx_detail#1` | Received | Dem send you | | ?? | heading beside the amount |
 | `ui::tx_detail#2` | Sent | You send | | ?? | |
 | `ui::tx_detail#3` | Moved | You move am | | ?? | internal transfer |
@@ -182,6 +213,7 @@ chosen here becomes the assertion.
 |---|---|---|---|---|---|
 | `ui::incoming#1` | 📥 Incoming {a} — unconfirmed | 📥 {a} dey enter — e never confirm | `{a}`, 📥 | OK | |
 | `ui::incoming#2` | 📥 Received {a} — ✅ {n} conf | 📥 You don receive {a} — ✅ {n} conf | `{a}`, `{n}`, 📥, ✅ | OK | |
+| `ui::incoming_many#1` | 📥 Received {n} payments — {a} /history lists them; /balance has the total. | 📥 You don receive {n} payments — {a} /history go list dem; /balance get di total. | `{n}`, `{a}`, `/history`, `/balance`, 📥 | ?? | grouped line for one sync pass |
 | `ui::confirmed#1` | ✅ {id} — {n} confs | ✅ {id} — {n} confs | `{id}`, `{n}`, ✅ | OK | |
 | `ui::confirmed_many#1` | ✅ {n} transactions confirmed. /history lists them; /balance has the total. | ✅ {n} transaction don confirm. /history go list dem; /balance get di total. | `{n}`, `/history`, `/balance`, ✅ | OK | |
 | `ui::session_expired#1` | 🔒 Session locked after inactivity. | 🔒 Session don lock becos you no do anything for a while. | 🔒 | OK | |
@@ -225,7 +257,7 @@ chosen here becomes the assertion.
 | `btn::cancel` | ✖ Cancel | ✖ Cancel | ✖ | OK | button |
 | `btn::custom_fee` | Custom sat/vB | My own sat/vB | | ?? | button |
 | `btn::min_rate` | At least {n} sat/vB | At least {n} sat/vB | `{n}` | OK | button |
-| `btn::refresh` | 🔄 Refresh | 🔄 Refresh | 🔄 | OK | button, `onchain.rs:109,145` |
+| `btn::refresh` | 🔄 Refresh | 🔄 Refresh | 🔄 | OK | button, `onchain::refresh_keyboard` |
 | `btn::pj_cancel` | ✖ Cancel {id} | ✖ Cancel {id} | `{id}`, ✖ | OK | button, `payjoin.rs:141` |
 
 ## 7. Faucet and mining

@@ -13,6 +13,7 @@
 use crate::{Ctx, ui};
 use anyhow::Result;
 use teloxide::{prelude::*, types::ParseMode};
+use wallet_core::types::UserId;
 use wallet_core::{CoreError, bitcoin::Amount};
 
 /// Above this many blocks, `/mine` says it is working before it starts.
@@ -119,9 +120,7 @@ pub async fn mine(bot: Bot, msg: Message, ctx: Ctx, blocks: String) -> Result<()
 /// No admin gate (see the module note). No PIN either: revealing the next
 /// address is a watch-only read, and nothing here spends the caller's coins.
 pub async fn faucet(bot: Bot, msg: Message, ctx: Ctx, sats: String) -> Result<()> {
-    let Some(from) = msg.from.as_ref() else {
-        return Ok(());
-    };
+    let user = crate::handlers::user_of(&msg, &ctx)?;
 
     let trimmed = sats.trim();
     let amount = if trimmed.is_empty() {
@@ -140,13 +139,22 @@ pub async fn faucet(bot: Bot, msg: Message, ctx: Ctx, sats: String) -> Result<()
             }
         }
     };
-    let amount = Amount::from_sat(amount);
 
-    #[allow(clippy::cast_possible_wrap)]
-    let user = ctx.users.resolve(from.id.0 as i64)?;
+    run_faucet(&bot, msg.chat.id, &ctx, user, amount).await
+}
+
+/// The default handout, for the inline button — which has no argument to carry
+/// and so asks for exactly what a bare `/faucet` asks for.
+pub const fn default_handout() -> u64 {
+    FAUCET_DEFAULT_SATS
+}
+
+/// Everything `/faucet` does once the amount is settled.
+pub async fn run_faucet(bot: &Bot, chat: ChatId, ctx: &Ctx, user: UserId, sats: u64) -> Result<()> {
+    let amount = Amount::from_sat(sats);
 
     if !matches!(ctx.core.wallet_exists(user), Ok(true)) {
-        bot.send_message(msg.chat.id, ui::faucet_needs_wallet())
+        bot.send_message(chat, ui::faucet_needs_wallet())
             .parse_mode(ParseMode::Html)
             .await?;
         return Ok(());
@@ -154,7 +162,7 @@ pub async fn faucet(bot: Bot, msg: Message, ctx: Ctx, sats: String) -> Result<()
 
     let to = match ctx.core.next_address(user).await {
         Ok(address) => address,
-        Err(e) => return crate::handlers::reply_error(&bot, &msg, &e).await,
+        Err(e) => return crate::handlers::reply_error_at(bot, chat, "/faucet", &e).await,
     };
 
     let txid = match ctx.core.faucet(&to.address, amount).await {
@@ -165,13 +173,13 @@ pub async fn faucet(bot: Bot, msg: Message, ctx: Ctx, sats: String) -> Result<()
         // wrong and the opposite of actionable. Only this handler knows whose
         // funds they were, so only this handler can say what to do about it.
         Err(CoreError::InsufficientFunds { available, .. }) => {
-            bot.send_message(msg.chat.id, ui::faucet_dry(available))
+            bot.send_message(chat, ui::faucet_dry(available))
                 .parse_mode(ParseMode::Html)
                 .await?;
             return Ok(());
         }
 
-        Err(e) => return crate::handlers::reply_error(&bot, &msg, &e).await,
+        Err(e) => return crate::handlers::reply_error_at(bot, chat, "/faucet", &e).await,
     };
 
     // Core mined a block to confirm the payment, so the coins are already
@@ -181,7 +189,7 @@ pub async fn faucet(bot: Bot, msg: Message, ctx: Ctx, sats: String) -> Result<()
     let price = ctx.core.price().await;
 
     bot.send_message(
-        msg.chat.id,
+        chat,
         ui::faucet_sent(
             ctx.core.network(),
             &to.address.to_string(),
