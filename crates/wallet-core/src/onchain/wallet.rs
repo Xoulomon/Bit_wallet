@@ -17,7 +17,7 @@ use crate::{
 };
 use bdk_wallet::{
     KeychainKind, PersistedWallet, Wallet,
-    bitcoin::{Address, Amount, Network, Txid},
+    bitcoin::{Address, Amount, Network, OutPoint, Txid},
     chain::ChainPosition,
     keys::bip39::Mnemonic,
     rusqlite::Connection,
@@ -212,6 +212,25 @@ impl OpenWallet {
 
     pub fn is_mine(&self, address: &Address) -> bool {
         self.wallet.is_mine(address.script_pubkey())
+    }
+
+    /// Whether this wallet owns the output an outpoint refers to (§7).
+    ///
+    /// Asks the keychain's own output index rather than scanning the
+    /// transactions the wallet happens to hold: the index covers every output
+    /// whose script this wallet has revealed, spent or unspent, and does not
+    /// depend on the funding transaction being canonical in the local chain.
+    /// The scan it replaces answered "not mine" for anything whose funding
+    /// transaction was not in the graph, which is the wrong way round for a
+    /// check whose whole job is to refuse.
+    ///
+    /// Note what this deliberately does *not* consult: any script the caller
+    /// supplies. In a payjoin the sender controls the `witness_utxo` of the
+    /// inputs it proposes and may advertise whatever `scriptPubKey` it likes,
+    /// so ownership has to be decided from the outpoint alone — which is why
+    /// the payjoin crate hands this check an `OutPoint` and not a script.
+    pub fn owns_outpoint(&self, outpoint: &OutPoint) -> bool {
+        self.wallet.spk_index().txout(*outpoint).is_some()
     }
 
     pub fn network(&self) -> Network {

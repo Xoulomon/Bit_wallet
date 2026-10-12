@@ -2362,15 +2362,39 @@ pub fn payjoin_sessions(network: Network, sessions: &[PayjoinSessionView]) -> St
     let mut out = format!("{}\n\n<b>Payjoin sessions</b>", badge(network));
     for s in sessions {
         out.push_str(&format!(
-            "\n\n{} {} — {}\n<code>{}</code>",
+            "\n\n{} {}{} — {}\n<code>{}</code>",
             payjoin_badge(&s.state),
             match s.role {
                 PayjoinRole::Receiver => "Receiving",
                 PayjoinRole::Sender => "Sending",
             },
+            // Core recorded the amount from the first commit but never read it
+            // back, so this line could not be written until now.
+            match s.amount {
+                Some(amount) => format!(" {}", sats(amount)),
+                None => String::new(),
+            },
             payjoin_state_text(&s.state),
             escape(&shorten(&s.id.to_string()))
         ));
+
+        // The transaction that settled it, where there is one. A `Completed`
+        // row used to carry an all-zeros txid, so printing it would have been
+        // worse than leaving it out.
+        if let PayjoinState::Completed { txid } | PayjoinState::FellBack { txid } = &s.state {
+            let id = txid.to_string();
+            let link = tx_link(network, &id, &shorten(&id));
+            out.push_str(&format!(
+                "\n{}",
+                // Regtest has no explorer, so fall back to the bare id rather
+                // than an empty line.
+                if link.is_empty() {
+                    format!("<code>{}</code>", escape(&shorten(&id)))
+                } else {
+                    link
+                }
+            ));
+        }
     }
     out
 }

@@ -2,24 +2,51 @@
 //!
 //! The `payjoin` crate models a session as an **event log**: each typestate
 //! transition appends an event, and replaying the log reconstructs the state.
-//! That is what makes "a bot restart resumes polling" cheap — there is no
-//! serialised state machine to version, only a list of events to replay.
+//! That is what makes resuming cheap — there is no serialised state machine to
+//! version, only a list of events to replay.
 //!
 //! One SQLite table holds every session's events, keyed by our own `SessionId`,
-//! so a restart can enumerate the open ones and replay each.
+//! so a restart can enumerate the open ones and replay each. `open_sessions`
+//! is that enumeration, and `WalletService::resume_payjoin_sessions` is its
+//! caller — it had none for a long time, which meant this module described a
+//! resumption that never happened. What a restart can do depends on what the
+//! session still needs:
+//!
+//! * a receiver past its proposal is only waiting to see which transaction
+//!   settled it, which is a chain lookup, so it resumes immediately;
+//! * a receiver short of that has to select an input and sign, and nobody is
+//!   unlocked a moment after a restart, so it resumes on the owner's next
+//!   `unlock`;
+//! * a sender's Original is signed and in the log, so it goes back on the wire
+//!   and the payment lands as an ordinary one.
+//!
+//! Rows are therefore kept past their expiry and removed only by `closed`:
+//! `expires_at` is when the *directory* session ends, not when there is
+//! nothing left to find out.
 
 use crate::{
     error::{CoreError, Result},
     service::types::{PayjoinRole, SessionId, UserId},
 };
+use bdk_wallet::bitcoin::{Amount, Txid};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     marker::PhantomData,
     path::Path,
+    str::FromStr,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+/// How long an outpoint stays in `pj_seen_inputs`.
+///
+/// `check_no_inputs_seen_before` is recorded *before* the session is known to
+/// succeed, so without a TTL a single failed attempt blacklists that sender's
+/// coins for good — and a sender whose first try failed for a reason on our
+/// side could never retry with the same UTXOs. A week is long enough to spoil
+/// probing, which is a burst, and short enough to forgive a bad afternoon.
+const SEEN_INPUT_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// The row the front end sees, before the event log is replayed.
 #[derive(Debug, Clone)]
@@ -33,7 +60,20 @@ pub struct SessionRow {
     /// The last state we recorded, so `/pj_sessions` can render without
     /// replaying every log (§8.2).
     pub state: String,
+    /// The transaction that settled this session, once one has.
+    ///
+    /// Recorded rather than derived, because the only moment it is knowable is
+    /// when the payjoin crate hands us a `SessionOutcome` — and a front end
+    /// that reads a closed row later still has to be able to show it.
+    pub txid: Option<Txid>,
+    /// What the receiver asked for, so `/pj_sessions` can say so (§8.2).
+    pub amount: Option<Amount>,
 }
+
+/// Every column `read_row` expects, in order. One constant so a new SELECT
+/// cannot drift from the reader and shift every column by one.
+const ROW_COLUMNS: &str =
+    "id, user_id, role, created_at, expires_at, closed, state, txid, amount_sat";
 
 /// The store behind every session's event log.
 pub struct SessionStore {
@@ -87,6 +127,24 @@ impl SessionStore {
                  seen_at  INTEGER NOT NULL
              );",
         )?;
+
+        // `CREATE TABLE IF NOT EXISTS` cannot add a column to a table that
+        // already exists, so the settlement txid arrives as its own migration.
+        // SQLite has no `ADD COLUMN IF NOT EXISTS`; a duplicate column is the
+        // ordinary second-run case and the only error worth swallowing here.
+        match db.execute("ALTER TABLE pj_sessions ADD COLUMN txid TEXT", []) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column name") => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        // Forget outpoints older than the TTL on the way in, so the sweep costs
+        // one statement per process rather than a background task.
+        db.execute(
+            "DELETE FROM pj_seen_inputs WHERE seen_at < ?1",
+            params![now_secs() - SEEN_INPUT_TTL.as_secs() as i64],
+        )?;
+
         Ok(())
     }
 
@@ -133,6 +191,23 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Record how a session ended, together with the transaction that settled
+    /// it (§7 step 4).
+    ///
+    /// The txid is the whole point: without it a closed session can say only
+    /// *that* it finished, and `/pj_sessions` had to invent an all-zeros txid
+    /// to fill the gap. `None` is for the outcomes that genuinely have no
+    /// transaction — a cancelled session, or a sender whose non-SegWit inputs
+    /// mean the proposal's txid was never knowable.
+    pub fn set_outcome(&self, id: SessionId, state: &str, txid: Option<Txid>) -> Result<()> {
+        let db = self.lock()?;
+        db.execute(
+            "UPDATE pj_sessions SET state = ?2, txid = ?3 WHERE id = ?1",
+            params![id.to_string(), state, txid.map(|t| t.to_string())],
+        )?;
+        Ok(())
+    }
+
     pub fn close(&self, id: SessionId) -> Result<()> {
         let db = self.lock()?;
         db.execute(
@@ -145,8 +220,7 @@ impl SessionStore {
     pub fn row(&self, id: SessionId) -> Result<Option<SessionRow>> {
         let db = self.lock()?;
         db.query_row(
-            "SELECT id, user_id, role, created_at, expires_at, closed, state
-             FROM pj_sessions WHERE id = ?1",
+            &format!("SELECT {ROW_COLUMNS} FROM pj_sessions WHERE id = ?1"),
             params![id.to_string()],
             read_row,
         )
@@ -157,44 +231,67 @@ impl SessionStore {
     /// Every session belonging to one user, newest first (§8.2).
     pub fn for_user(&self, user: UserId) -> Result<Vec<SessionRow>> {
         let db = self.lock()?;
-        let mut stmt = db.prepare(
-            "SELECT id, user_id, role, created_at, expires_at, closed, state
-             FROM pj_sessions WHERE user_id = ?1 ORDER BY created_at DESC",
-        )?;
+        let mut stmt = db.prepare(&format!(
+            "SELECT {ROW_COLUMNS} FROM pj_sessions
+             WHERE user_id = ?1 ORDER BY created_at DESC"
+        ))?;
         let rows = stmt.query_map(params![user.to_string()], read_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
 
-    /// Sessions a restart must resume polling (§7).
+    /// Sessions a restart must resume (§7).
+    ///
+    /// Deliberately *not* filtered by `expires_at`: a receiver that has already
+    /// posted its proposal is waiting on a transaction to settle, which is a
+    /// chain question and outlives the directory session. Filtering those out
+    /// here is what made a restart lose exactly the sessions worth resuming.
+    /// The caller decides what each role and state still has to do.
     pub fn open_sessions(&self) -> Result<Vec<SessionRow>> {
         let db = self.lock()?;
-        let mut stmt = db.prepare(
-            "SELECT id, user_id, role, created_at, expires_at, closed, state
-             FROM pj_sessions WHERE closed = 0 AND expires_at > ?1",
-        )?;
-        let rows = stmt.query_map(params![now_secs()], read_row)?;
+        let mut stmt = db.prepare(&format!(
+            "SELECT {ROW_COLUMNS} FROM pj_sessions WHERE closed = 0"
+        ))?;
+        let rows = stmt.query_map([], read_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
 
     /// §7: remember an outpoint the receiver has contributed against, so the
     /// same input cannot be replayed to probe which coins are ours.
+    ///
+    /// Returns whether this is the first sighting. A row past `SEEN_INPUT_TTL`
+    /// does not count as one: it is dropped and the outpoint is recorded
+    /// afresh. The sweep in `migrate` only runs when the store is opened, and
+    /// a bot that stays up for a month would otherwise keep enforcing
+    /// sightings it had already decided to forget.
     pub fn remember_input(&self, outpoint: &str) -> Result<bool> {
         let db = self.lock()?;
+        let now = now_secs();
+
+        db.execute(
+            "DELETE FROM pj_seen_inputs WHERE outpoint = ?1 AND seen_at < ?2",
+            params![outpoint, now - SEEN_INPUT_TTL.as_secs() as i64],
+        )?;
+
         let inserted = db.execute(
             "INSERT OR IGNORE INTO pj_seen_inputs (outpoint, seen_at) VALUES (?1, ?2)",
-            params![outpoint, now_secs()],
+            params![outpoint, now],
         )?;
         Ok(inserted == 1)
     }
 
+    /// Whether this outpoint counts as seen *now* — a sighting older than the
+    /// TTL does not.
     pub fn has_seen_input(&self, outpoint: &str) -> Result<bool> {
         let db = self.lock()?;
         let found: Option<i64> = db
             .query_row(
-                "SELECT 1 FROM pj_seen_inputs WHERE outpoint = ?1",
-                params![outpoint],
+                "SELECT 1 FROM pj_seen_inputs WHERE outpoint = ?1 AND seen_at >= ?2",
+                params![
+                    outpoint,
+                    now_secs() - SEEN_INPUT_TTL.as_secs() as i64
+                ],
                 |r| r.get(0),
             )
             .optional()?;
@@ -229,6 +326,15 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
         expires_at: UNIX_EPOCH + Duration::from_secs(r.get::<_, i64>(4)?.max(0) as u64),
         closed: r.get::<_, i64>(5)? != 0,
         state: r.get(6)?,
+        // A txid that cannot be parsed is a corrupt row, not a reason to fail
+        // the whole listing: the state beside it is still worth showing.
+        txid: r
+            .get::<_, Option<String>>(7)?
+            .and_then(|raw| Txid::from_str(&raw).ok()),
+        amount: r
+            .get::<_, Option<i64>>(8)?
+            .and_then(|sats| u64::try_from(sats).ok())
+            .map(Amount::from_sat),
     })
 }
 
@@ -410,8 +516,13 @@ mod tests {
     }
 
     /// §7: a restart resumes polling, which means finding the open sessions.
+    ///
+    /// Expiry is **not** a filter here, and that is the fix: a receiver past
+    /// its directory expiry may still be waiting to see which transaction
+    /// settled it, and dropping those rows is what made a restart lose exactly
+    /// the sessions worth resuming. Only `closed` takes a session off the list.
     #[test]
-    fn only_open_unexpired_sessions_are_resumed() {
+    fn every_unclosed_session_is_offered_for_resumption() {
         let s = store();
         let user = UserId::new();
 
@@ -441,8 +552,96 @@ mod tests {
             .expect("creates");
 
         let open = s.open_sessions().expect("lists");
-        assert_eq!(open.len(), 1);
-        assert_eq!(open[0].id, live);
+        let ids: Vec<_> = open.iter().map(|r| r.id).collect();
+        assert!(ids.contains(&live), "a live session resumes");
+        assert!(
+            ids.contains(&expired),
+            "an expired session still has a settlement to watch for"
+        );
+        assert!(!ids.contains(&closed), "a closed session is finished");
+        assert_eq!(open.len(), 2);
+    }
+
+    /// §7: the settlement txid is the one fact a closed session has to keep —
+    /// without it `/pj_sessions` had to invent an all-zeros txid.
+    #[test]
+    fn an_outcome_records_the_transaction_that_settled_the_session() {
+        let s = store();
+        let id = SessionId::new();
+        s.create(
+            id,
+            UserId::new(),
+            PayjoinRole::Receiver,
+            Duration::from_secs(3600),
+            Some(120_000),
+        )
+        .expect("creates");
+
+        assert!(s.row(id).expect("reads").expect("exists").txid.is_none());
+
+        let txid = Txid::from_str(
+            "6a0c1b8f0a2f1a4e5b3c7d9e8f0a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2",
+        )
+        .expect("a valid txid");
+        s.set_outcome(id, "Completed", Some(txid)).expect("records");
+
+        let row = s.row(id).expect("reads").expect("exists");
+        assert_eq!(row.state, "Completed");
+        assert_eq!(row.txid, Some(txid));
+    }
+
+    /// §8.2: the amount was written from the first commit and never read back,
+    /// so `/pj_sessions` could not show what the receiver had asked for.
+    #[test]
+    fn the_requested_amount_survives_a_round_trip() {
+        let s = store();
+        let id = SessionId::new();
+        s.create(
+            id,
+            UserId::new(),
+            PayjoinRole::Receiver,
+            Duration::from_secs(3600),
+            Some(120_000),
+        )
+        .expect("creates");
+
+        assert_eq!(
+            s.row(id).expect("reads").expect("exists").amount,
+            Some(Amount::from_sat(120_000))
+        );
+    }
+
+    /// §7: a sender whose first attempt failed on *our* side must be able to
+    /// retry with the same coins once the TTL has passed.
+    #[test]
+    fn a_seen_outpoint_is_forgotten_once_the_ttl_has_passed() {
+        let s = store();
+        let outpoint = "0000000000000000000000000000000000000000000000000000000000000002:1";
+        assert!(s.remember_input(outpoint).expect("remembers"));
+        assert!(s.has_seen_input(outpoint).expect("queries"));
+
+        // Age the row past the TTL. No sweep needed: the reads are TTL-aware,
+        // which is what makes this true for a bot that never restarts.
+        {
+            let db = s.lock().expect("locks");
+            db.execute(
+                "UPDATE pj_seen_inputs SET seen_at = ?1 WHERE outpoint = ?2",
+                params![
+                    now_secs() - SEEN_INPUT_TTL.as_secs() as i64 - 1,
+                    outpoint
+                ],
+            )
+            .expect("ages the row");
+        }
+
+        assert!(
+            !s.has_seen_input(outpoint).expect("queries"),
+            "a stale outpoint must not blacklist a sender's coins for good"
+        );
+        assert!(
+            s.remember_input(outpoint).expect("remembers"),
+            "and the sender may contribute it again, which is the point"
+        );
     }
 
     #[test]
