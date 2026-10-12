@@ -25,9 +25,49 @@ use std::time::Duration;
 use wallet_core::{
     AppConfig, NetworkChoice, WalletService,
     config::{BackendConfig, CoreRpcConfig},
-    service::types::{Pin, SendAmount, SendRequest, UserId},
+    service::types::{Pin, PayjoinState, SendAmount, SendRequest, SessionId, UserId},
 };
 use zeroize::Zeroizing;
+
+/// Wait for the receiver's own session to reach a verdict (§7 step 4).
+///
+/// This is the assertion the test used to be missing entirely, and its absence
+/// is what let a broken receive path look healthy: everything here only ever
+/// checked the *sender's* `Broadcast`, so a receiver that polled for an hour
+/// and then reported `Expired` passed just as well as one that completed.
+async fn settled(
+    core: &WalletService,
+    user: UserId,
+    session: SessionId,
+    patience: Duration,
+) -> PayjoinState {
+    let deadline = std::time::Instant::now() + patience;
+
+    loop {
+        let found = core
+            .payjoin_sessions(user)
+            .await
+            .expect("sessions list")
+            .into_iter()
+            .find(|s| s.id == session)
+            .expect("the session we opened is listed");
+
+        let settled = matches!(
+            found.state,
+            PayjoinState::Completed { .. }
+                | PayjoinState::FellBack { .. }
+                | PayjoinState::Expired
+                | PayjoinState::Cancelled
+                | PayjoinState::Failed { .. }
+        );
+
+        if settled || std::time::Instant::now() > deadline {
+            return found.state;
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
 
 /// Public infrastructure, as `.env.example` uses. The directory only stores and
 /// forwards PSBTs, so a regtest session through it moves nothing real.
@@ -48,7 +88,16 @@ fn init_logging() {
 
 fn harness() -> (Node, AppConfig, tempfile::TempDir) {
     init_logging();
-    let node = Node::from_downloaded().expect("a regtest bitcoind starts");
+
+    // `-txindex` is for the test's own benefit, not the wallet's: checking that
+    // one of the final transaction's inputs is the *receiver's* means looking
+    // up each input's parent, and without an index `getrawtransaction` only
+    // answers for transactions still in the mempool. Nothing in `wallet-core`
+    // depends on an index — see `onchain::wallet` on why.
+    let mut conf = corepc_node::Conf::default();
+    conf.args.push("-txindex");
+    let node =
+        Node::from_downloaded_with_conf(&conf).expect("a regtest bitcoind starts with an index");
     let dir = tempfile::tempdir().expect("temp dir");
     let (user, pass) = match node.params.get_cookie_values().expect("cookie readable") {
         Some(v) => (v.user, v.password),
@@ -187,12 +236,63 @@ async fn two_wallets_complete_a_v2_payjoin() {
          not a fallback"
     );
 
+    // §6 step 6: the sender's wallet knows about it *before* a block. On a
+    // backend with no mempool this is the only way an outgoing payment shows
+    // at all until it confirms, and the payjoin path used to return without
+    // recording it — so a payjoin send was invisible in /balance and
+    // /history, and /bumpfee could not find it.
+    let pending = core
+        .history(sender, wallet_core::service::types::Page::new(0))
+        .await
+        .expect("history");
+    assert!(
+        pending.items.iter().any(|t| t.txid == broadcast.txid),
+        "the payjoin must appear in the sender's history before a block lands"
+    );
+
     // §10: inputs from both wallets. That is the whole privacy claim — the
     // common-input-ownership heuristic now points at two owners, not one.
+    //
+    // Checking the *count* is not enough: a sender spending two of its own
+    // coins satisfies that on its own. What has to be true is that one of the
+    // inputs belongs to the receiver.
     assert!(
         tx.input.len() >= 2,
         "a payjoin has inputs from both parties, found {}",
         tx.input.len()
+    );
+
+    let mut receiver_scripts = Vec::new();
+    for page in 0..5 {
+        let listed = core
+            .addresses(receiver, wallet_core::service::types::Page::new(page))
+            .await
+            .expect("addresses");
+        if listed.items.is_empty() {
+            break;
+        }
+        receiver_scripts.extend(listed.items.iter().map(|a| a.address.script_pubkey()));
+    }
+    assert!(
+        !receiver_scripts.is_empty(),
+        "the receiver has revealed addresses to compare against"
+    );
+    let contributed = tx.input.iter().any(|input| {
+        node.client
+            .get_raw_transaction(input.previous_output.txid)
+            .ok()
+            .and_then(|raw| raw.transaction().ok())
+            .and_then(|parent| {
+                parent
+                    .output
+                    .get(input.previous_output.vout as usize)
+                    .cloned()
+            })
+            .is_some_and(|out| receiver_scripts.contains(&out.script_pubkey))
+    });
+    assert!(
+        contributed,
+        "one of the inputs has to be the receiver's, or no heuristic was broken"
     );
 
     node.client
@@ -216,6 +316,74 @@ async fn two_wallets_complete_a_v2_payjoin() {
         "the receiver ended up with more than they started with"
     );
     assert!(sender_after < sender_before, "the sender paid");
+
+    // --- and the receiver agrees -------------------------------------------
+    //
+    // §7 step 4. The receiver only learns which transaction settled its
+    // session by driving the payjoin crate's `Monitor` typestate, and nothing
+    // used to drive it: the session polled until its hour was up and reported
+    // `Expired` — for a payjoin that had completed perfectly. Everything above
+    // this line passed throughout.
+    let state = settled(&core, receiver, receipt.session_id, Duration::from_secs(180)).await;
+    eprintln!("receiver session ended as {state:?}");
+
+    assert_eq!(
+        state,
+        PayjoinState::Completed {
+            txid: broadcast.txid
+        },
+        "the receiver must report the payjoin it actually took part in, naming \
+         the transaction that settled it"
+    );
+
+    core.shutdown().await;
+}
+
+/// §7: a receiver that is cancelled stops, rather than carrying on for its
+/// full hour and then overwriting the user's `Cancelled` with `Expired`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the public payjoin directory; run with --ignored"]
+async fn a_cancelled_receive_session_stops_and_stays_cancelled() {
+    let (node, cfg, _dir) = harness();
+    let core = WalletService::new(cfg).await.expect("service starts");
+
+    let receiver = UserId::new();
+    let pin = Pin::new("864213");
+    core.create_wallet(receiver, &pin).await.expect("receiver");
+
+    let miner = node.client.new_address().expect("node address");
+    node.client.generate_to_address(101, &miner).expect("mines");
+
+    let receipt = core
+        .payjoin_receive(receiver, Amount::from_sat(50_000))
+        .await
+        .expect("session opens");
+
+    // Let the polling task get going, so cancellation has something to stop.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    core.payjoin_cancel(receiver, receipt.session_id)
+        .await
+        .expect("cancels");
+
+    // Long enough for a task that ignored the cancel to come back round and
+    // overwrite the state, which is exactly what used to happen.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let state = core
+        .payjoin_sessions(receiver)
+        .await
+        .expect("sessions")
+        .into_iter()
+        .find(|s| s.id == receipt.session_id)
+        .expect("listed")
+        .state;
+
+    assert_eq!(
+        state,
+        PayjoinState::Cancelled,
+        "a cancelled session must stay cancelled"
+    );
 
     core.shutdown().await;
 }
@@ -289,5 +457,45 @@ async fn an_unanswered_payjoin_falls_back_to_an_ordinary_payment() {
         .get_raw_transaction(broadcast.txid)
         .expect("the fallback transaction was broadcast");
 
+    // §6 step 6 again: a fallback is a payment, so it has to be visible as
+    // one straight away.
+    let pending = core
+        .history(sender, wallet_core::service::types::Page::new(0))
+        .await
+        .expect("history");
+    assert!(
+        pending.items.iter().any(|t| t.txid == broadcast.txid),
+        "the fallback must appear in the sender's history before a block lands"
+    );
+
+    // The sender's own session has to say `FellBack`, with the transaction
+    // that actually went out — not `Completed` with an invented txid.
+    let state = settled(
+        &core,
+        sender,
+        sender_session(&core, sender).await,
+        Duration::from_secs(30),
+    )
+    .await;
+    assert_eq!(
+        state,
+        PayjoinState::FellBack {
+            txid: broadcast.txid
+        },
+        "a fallback is a payjoin that did not happen, and must not be reported \
+         as one that did"
+    );
+
     core.shutdown().await;
+}
+
+/// The sender's own session id, which `confirm_send` does not hand back.
+async fn sender_session(core: &WalletService, user: UserId) -> SessionId {
+    core.payjoin_sessions(user)
+        .await
+        .expect("sessions")
+        .into_iter()
+        .find(|s| s.role == wallet_core::service::types::PayjoinRole::Sender)
+        .expect("the send attempt opened a session")
+        .id
 }

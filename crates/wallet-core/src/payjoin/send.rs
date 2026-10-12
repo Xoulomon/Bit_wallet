@@ -40,6 +40,12 @@ const POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// What a completed attempt produced.
 pub struct Outcome {
     pub txid: Txid,
+    /// The transaction that went out — the payjoin, or the fallback.
+    ///
+    /// Carried rather than just its id because the caller has to insert it
+    /// into the wallet as unconfirmed: on a backend with no mempool that is
+    /// the only way the payment shows up before a block (§4b, §6).
+    pub tx: Transaction,
     /// False when the fallback was broadcast instead (§7 step 4).
     pub payjoin: bool,
 }
@@ -84,11 +90,14 @@ pub async fn attempt(a: Attempt) -> Result<Outcome> {
     match try_payjoin(&a, session).await {
         Ok(Some(proposal)) => {
             // The receiver's proposal, signed by us and broadcast.
-            let txid = finish(&a, proposal).await?;
+            let tx = finish(&a, proposal).await?;
+            let txid = tx.compute_txid();
             publish(PayjoinState::Completed { txid });
+            let _ = a.store.set_outcome(session, "Completed", Some(txid));
             let _ = a.store.close(session);
             Ok(Outcome {
                 txid,
+                tx,
                 payjoin: true,
             })
         }
@@ -112,9 +121,11 @@ pub async fn attempt(a: Attempt) -> Result<Outcome> {
             // through either way — only the privacy gain is lost.
             let txid = broadcast(&a.cfg, &fallback).await?;
             publish(PayjoinState::FellBack { txid });
+            let _ = a.store.set_outcome(session, "FellBack", Some(txid));
             let _ = a.store.close(session);
             Ok(Outcome {
                 txid,
+                tx: fallback,
                 payjoin: false,
             })
         }
@@ -247,7 +258,7 @@ async fn v1_exchange(a: &Attempt, uri: &PjUri) -> Result<Option<Psbt>> {
 }
 
 /// Sign our inputs in the receiver's proposal, finalise and broadcast (§7 step 3).
-async fn finish(a: &Attempt, proposal: Psbt) -> Result<Txid> {
+async fn finish(a: &Attempt, proposal: Psbt) -> Result<Transaction> {
     let wallet = OpenWallet::load(&a.cfg.wallet_db(&a.user), a.cfg.network.network())?;
 
     // The proposal carries the receiver's contributed input as well as ours,
@@ -260,10 +271,11 @@ async fn finish(a: &Attempt, proposal: Psbt) -> Result<Txid> {
         .extract_tx()
         .map_err(|e| CoreError::Wallet(e.to_string()))?;
 
-    broadcast(&a.cfg, &tx).await
+    broadcast(&a.cfg, &tx).await?;
+    Ok(tx)
 }
 
-async fn broadcast(cfg: &AppConfig, tx: &Transaction) -> Result<Txid> {
+pub(crate) async fn broadcast(cfg: &AppConfig, tx: &Transaction) -> Result<Txid> {
     let cfg = cfg.clone();
     let raw = bdk_wallet::bitcoin::consensus::encode::serialize_hex(tx);
     let txid = tx.compute_txid();
@@ -296,6 +308,27 @@ pub fn parse_uri(raw: &str, network: bdk_wallet::bitcoin::Network) -> Result<PjU
 
     uri.check_pj_supported()
         .map_err(|_| CoreError::Payjoin("that URI does not offer payjoin".into()))
+}
+
+/// Put the Original of an interrupted sender session back on the wire (§7).
+///
+/// A sender session that is still open at startup means the process died
+/// mid-exchange, and we no longer know how far it got. The Original is signed
+/// and sitting in the event log, and broadcasting a transaction that is already
+/// on the wire is a no-op — so this is safe to do blind. It gives up the
+/// payjoin in exchange for the guarantee that an interrupted payment still
+/// lands, which is the same trade `attempt` makes on a timeout: a payjoin that
+/// fails must never mean a payment that failed.
+pub async fn resume(cfg: &AppConfig, store: &SessionStore, session: SessionId) -> Result<Txid> {
+    let persister = store.persister::<SessionEvent>(session);
+    let (_, history) =
+        replay_event_log(&persister).map_err(|e| CoreError::Payjoin(e.to_string()))?;
+
+    let fallback = history.fallback_tx();
+    let txid = broadcast(cfg, &fallback).await?;
+    store.set_outcome(session, "FellBack", Some(txid))?;
+    store.close(session)?;
+    Ok(txid)
 }
 
 #[cfg(test)]

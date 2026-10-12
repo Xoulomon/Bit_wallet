@@ -22,7 +22,8 @@ you.
 | **Sync** | One shared block emitter serves every user, so a block is fetched once however many wallets exist. |
 | **Balance and history** | Confirmed, pending and immature, in sats and BTC, with an approximate `≈ $` value; history with fees and confirmation counts. |
 | **Send** | Fee presets or a typed sat/vB, a confirmation card with every number on it, PIN-gated signing, broadcast, confirmation tracking. `/bumpfee` for a rate that turned out too low. |
-| **Payjoin** | `/pj_receive` opens a BIP77 v2 session; paying a `pj=` URI uses the payjoin sender, falling back to an ordinary transaction if the receiver never answers. |
+| **Payjoin** | `/pj_receive` opens a BIP77 v2 session; paying a `pj=` URI uses the payjoin sender, falling back to an ordinary transaction if the receiver never answers. A receiving session then watches the chain to see *which* transaction settled it — the payjoin or the sender's fallback — and reports that, with its txid. |
+| **Payjoin resumption** | Sessions are an event log, so a restart picks up what was in flight: a receiver watching for settlement resumes at once, one that still needs the seed resumes on the owner's next `/unlock`, and an interrupted send puts its original back on the wire so the payment lands. |
 | **Two front ends** | The Telegram bot and `wallet-cli` drive the same `WalletService`. Deleting either leaves a working wallet. |
 
 ---
@@ -252,9 +253,12 @@ it that way.
   fallback. If that API is unreachable the bot asks for the rate instead of
   guessing. Every rate is floored at the node's own `mempoolminfee`;
   `/bumpfee` is the remedy for a rate that turns out too low.
-- **No `testmempoolaccept` on mainnet:** broadcasts go out without a dry run,
-  and payjoin's broadcast-suitability check is best-effort rather than
-  authoritative.
+- **No `testmempoolaccept` on mainnet:** broadcasts go out without a dry run.
+  A payjoin receiver therefore skips the broadcast-suitability check entirely
+  off regtest (`assume_interactive_receiver`) rather than running a weaker one
+  that only looks like a check — the check guards non-interactive receivers
+  against probing, and a `/pj_receive` URI is interactive by construction: you
+  asked for it and handed it to one payer. On regtest it is a real dry run.
 - **Mainnet restores are capped** at `MAINNET_MAX_RESCAN_BLOCKS` (~10 000
   blocks, ~10 weeks). Recovering a genuinely old wallet needs a different chain
   source; a full SegWit-era rescan through BitRPC would take roughly 230 hours.
@@ -304,10 +308,20 @@ because it needs the public directory:
 cargo test -p wallet-core --test payjoin_e2e -- --ignored --nocapture
 ```
 
-Two wallets complete a real BIP77 v2 payjoin — the receiver contributes an
-input, the final transaction has inputs from both, and the balances move by the
-right amounts — plus the case where nobody is listening and the sender falls
-back to an ordinary payment. §10 asks for `payjoin-test-utils` instead, which
+Two wallets complete a real BIP77 v2 payjoin, and the test checks it from both
+sides: the final transaction contains an input that is *the receiver's* (a
+count of two proves nothing — a sender spending two of its own coins satisfies
+that), the sender sees the payment as pending before a block lands, the
+balances move by the right amounts, and the receiver's own session reports
+`Completed` naming the transaction that settled it. Plus the case where nobody
+is listening and the sender falls back to an ordinary payment, and the case
+where a receiving session is cancelled and has to stay cancelled.
+
+That last set of assertions is newer than the rest, and the reason is worth
+stating: the test originally checked only the sender's `Broadcast`, so a
+receiver that polled for its full hour and then reported `Expired` — for a
+payjoin that had completed perfectly — passed exactly as well as one that
+worked. §10 asks for `payjoin-test-utils` instead, which
 would keep this off the network; its only published version depends on
 `payjoin` 0.24 while this project uses 1.1, so it cannot be used yet.
 [`docs/payjoin-setup.md`](docs/payjoin-setup.md) explains why a local directory

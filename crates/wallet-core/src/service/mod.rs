@@ -26,7 +26,11 @@ use crate::{
 };
 use bdk_wallet::bitcoin::{Address, Amount, BlockHash, FeeRate, Network, Txid};
 use events::{CoreEvent, EVENT_CHANNEL_CAPACITY};
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::sync::broadcast;
 use types::*;
 use zeroize::Zeroizing;
@@ -44,6 +48,15 @@ pub struct WalletService {
     /// Drafted payments awaiting a human (§3a rule 4).
     quotes: crate::onchain::quotes::Quotes,
     payjoin: Arc<crate::payjoin::persist::SessionStore>,
+    /// A cancel switch per running receive task.
+    ///
+    /// `payjoin_cancel` used to mark the row and nothing else: the task kept
+    /// polling for the full hour and then overwrote the user's `Cancelled`
+    /// with `Expired`. The task holds the receiving half of each of these.
+    pj_cancels: Mutex<HashMap<SessionId, tokio::sync::watch::Sender<bool>>>,
+    /// Receive sessions a restart found open that still need their owner's
+    /// seed, so they resume on the next `unlock` rather than never (§7).
+    pj_awaiting_unlock: Mutex<Vec<(UserId, SessionId)>>,
 }
 
 /// Borrow an address from one of the node's own wallets, for a `/mine` with no
@@ -177,7 +190,7 @@ impl WalletService {
         );
         tokio::spawn(syncer.run(shutdown_rx));
 
-        Ok(Arc::new(WalletService {
+        let service = Arc::new(WalletService {
             cfg,
             chain,
             events,
@@ -188,7 +201,127 @@ impl WalletService {
             shutdown: shutdown_tx,
             quotes: crate::onchain::quotes::Quotes::new(),
             payjoin: Arc::new(crate::payjoin::persist::SessionStore::open(&payjoin_db)?),
-        }))
+            pj_cancels: Mutex::new(HashMap::new()),
+            pj_awaiting_unlock: Mutex::new(Vec::new()),
+        });
+
+        // §7: the event log exists so a restart can pick a session back up.
+        // `open_sessions` had no caller before this, so every restart silently
+        // abandoned whatever was in flight — including sessions whose payjoin
+        // had already succeeded and only needed to be recognised.
+        service.resume_payjoin_sessions();
+
+        Ok(service)
+    }
+
+    /// Pick up the payjoin sessions an earlier run left open (§7).
+    ///
+    /// Three cases, because they need different things:
+    ///
+    /// * a receiver past its proposal is waiting on a transaction, which is a
+    ///   chain lookup and needs no seed — resume it now;
+    /// * a receiver short of that needs the seed to select an input and sign,
+    ///   and nobody is unlocked a moment after a restart — park it for the
+    ///   owner's next `unlock`;
+    /// * a sender means we died mid-exchange, so put its Original back on the
+    ///   wire and let the payment land as an ordinary one.
+    fn resume_payjoin_sessions(self: &Arc<Self>) {
+        let rows = match self.payjoin.open_sessions() {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not list payjoin sessions to resume");
+                return;
+            }
+        };
+
+        for row in rows {
+            match row.role {
+                PayjoinRole::Sender => {
+                    let service = Arc::clone(self);
+                    tokio::spawn(async move {
+                        match crate::payjoin::send::resume(
+                            &service.cfg,
+                            &service.payjoin,
+                            row.id,
+                        )
+                        .await
+                        {
+                            Ok(txid) => {
+                                tracing::info!(
+                                    session = %row.id,
+                                    %txid,
+                                    "rebroadcast an interrupted payjoin send as an ordinary payment"
+                                );
+                                service.emit(CoreEvent::Payjoin {
+                                    user: row.user,
+                                    session: row.id,
+                                    state: PayjoinState::FellBack { txid },
+                                });
+                            }
+                            Err(e) => tracing::warn!(
+                                session = %row.id,
+                                error = %e,
+                                "could not resume an interrupted payjoin send"
+                            ),
+                        }
+                    });
+                }
+                PayjoinRole::Receiver => {
+                    if crate::payjoin::receive::needs_seed(&self.payjoin, row.id) {
+                        tracing::info!(
+                            session = %row.id,
+                            "payjoin receive waiting for its owner to unlock before it can resume"
+                        );
+                        if let Ok(mut parked) = self.pj_awaiting_unlock.lock() {
+                            parked.push((row.user, row.id));
+                        }
+                        continue;
+                    }
+
+                    // Past the proposal: all that is left is to see which
+                    // transaction settled, and that is a chain lookup. So it
+                    // resumes now, with no seed and no wait — which is the
+                    // whole point of `needs_seed` being the gate.
+                    tracing::info!(
+                        session = %row.id,
+                        "resuming a payjoin receive that is watching for settlement"
+                    );
+                    self.spawn_payjoin_receive(row.user, row.id, None);
+                }
+            }
+        }
+    }
+
+    /// Start the polling task for one receive session, keeping its cancel
+    /// switch so `payjoin_cancel` can actually stop it.
+    fn spawn_payjoin_receive(
+        &self,
+        user: UserId,
+        session: SessionId,
+        mnemonic: Option<bdk_wallet::keys::bip39::Mnemonic>,
+    ) {
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        if let Ok(mut cancels) = self.pj_cancels.lock() {
+            // A task that has finished dropped its receiver, so its switch is
+            // dead weight. Pruning on insert bounds this map by the number of
+            // sessions actually running rather than by the number ever started.
+            cancels.retain(|_, switch| switch.receiver_count() > 0);
+            cancels.insert(session, cancel_tx);
+        }
+
+        // The polling task lives in core, so any front end — or none — sees the
+        // session through to its end (§7 step 3).
+        tokio::spawn(crate::payjoin::receive::run(
+            crate::payjoin::receive::Context {
+                cfg: self.cfg.clone(),
+                store: Arc::clone(&self.payjoin),
+                events: self.events.clone(),
+                user,
+                session,
+                mnemonic,
+                cancel: cancel_rx,
+            },
+        ));
     }
 
     /// Which chain this instance is bound to. Every front end reads this to
@@ -424,7 +557,25 @@ impl WalletService {
     pub async fn unlock(&self, u: UserId, pin: &Pin) -> Result<SessionInfo> {
         let words = self.storage.unseal(u, pin.expose())?;
         let mnemonic = keys::parse(&words)?;
-        Ok(self.sessions.unlock(u, mnemonic))
+        let info = self.sessions.unlock(u, mnemonic.clone());
+
+        // §7: a receive session a restart could not resume without the seed
+        // has been waiting for exactly this moment.
+        let parked: Vec<SessionId> = match self.pj_awaiting_unlock.lock() {
+            Ok(mut queue) => {
+                let (mine, theirs) = queue.iter().partition::<Vec<_>, _>(|(user, _)| *user == u);
+                *queue = theirs;
+                mine.into_iter().map(|(_, session)| session).collect()
+            }
+            Err(_) => Vec::new(),
+        };
+
+        for session in parked {
+            tracing::info!(user = %u, %session, "resuming a payjoin receive after unlock");
+            self.spawn_payjoin_receive(u, session, Some(mnemonic.clone()));
+        }
+
+        Ok(info)
     }
 
     pub fn lock(&self, u: UserId) {
@@ -718,6 +869,15 @@ impl WalletService {
             .await?;
 
             tracing::info!(user = %u, txid = %outcome.txid, payjoin = outcome.payjoin, "broadcast");
+
+            // §6 step 6, and it was missing on exactly this path: the ordinary
+            // branch below records the broadcast so the payment shows as
+            // pending at once, and on a backend with no mempool that is the
+            // *only* way an outgoing payment appears before a block. Returning
+            // here without it left a payjoin — and its fallback — invisible in
+            // /balance and /history, and unreachable from /bumpfee.
+            wallet.record_broadcast(outcome.tx)?;
+
             return Ok(Broadcast {
                 txid: outcome.txid,
                 amount: quote.amount,
@@ -881,18 +1041,7 @@ impl WalletService {
         )
         .await?;
 
-        // The polling task lives in core, so any front end — or none — sees the
-        // session through to its end (§7 step 3).
-        tokio::spawn(crate::payjoin::receive::run(
-            crate::payjoin::receive::Context {
-                cfg: self.cfg.clone(),
-                store: Arc::clone(&self.payjoin),
-                events: self.events.clone(),
-                user: u,
-                session: started.session,
-                mnemonic,
-            },
-        ));
+        self.spawn_payjoin_receive(u, started.session, Some(mnemonic));
 
         Ok(PayjoinReceipt {
             session_id: started.session,
@@ -911,9 +1060,11 @@ impl WalletService {
                 state: if row.closed && row.state == "Waiting" {
                     PayjoinState::Cancelled
                 } else {
-                    crate::payjoin::receive::state_from_label(&row.state)
+                    crate::payjoin::receive::state_from_row(&row)
                 },
-                amount: None,
+                // Written since the first commit and never read back, so
+                // `/pj_sessions` could not say what was asked for (§8.2).
+                amount: row.amount,
                 created_at: row.created_at,
                 expires_at: row.expires_at,
             })
@@ -925,6 +1076,15 @@ impl WalletService {
         // Another user's session id reads exactly like one that does not exist.
         if row.user != u {
             return Err(CoreError::NoSuchSession);
+        }
+
+        // Stop the task *first*. Marking the row and leaving it polling is
+        // what let a cancelled session come back an hour later and overwrite
+        // the user's `Cancelled` with `Expired`.
+        if let Ok(mut cancels) = self.pj_cancels.lock()
+            && let Some(switch) = cancels.remove(&id)
+        {
+            let _ = switch.send(true);
         }
 
         self.payjoin.set_state(id, "Cancelled")?;
